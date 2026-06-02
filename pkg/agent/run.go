@@ -816,6 +816,16 @@ func (m *AgentManager) Start(ctx context.Context, opts api.StartOptions) (*api.A
 		}
 	}
 
+	// Allocate ports from the pool if available
+	var allocatedPorts []int
+	if m.PortPool != nil {
+		ports, err := m.PortPool.Allocate(opts.Name, m.PortPool.PerAgent())
+		if err != nil {
+			return nil, fmt.Errorf("port allocation failed: %w", err)
+		}
+		allocatedPorts = ports
+	}
+
 	runCfg := runtime.RunConfig{
 		Name:               containerName(projectName, opts.Name),
 		Template:           template,
@@ -890,6 +900,13 @@ func (m *AgentManager) Start(ctx context.Context, opts api.StartOptions) (*api.A
 		MetadataInterception: hasMetadataInterception(agentEnv),
 		ExtraHosts:           mergeExtraHosts(opts.ExtraHosts, runtime.BridgeExtraHosts(m.Runtime.Name(), agentEnv)),
 		NetworkMode:          dockerNetworkMode,
+		AllocatedPorts: allocatedPorts,
+		PortHostURL: func() string {
+			if m.PortPool != nil {
+				return m.PortPool.HostURL()
+			}
+			return ""
+		}(),
 		Labels: func() map[string]string {
 			l := map[string]string{
 				"scion.agent":          "true",
@@ -919,6 +936,9 @@ func (m *AgentManager) Start(ctx context.Context, opts api.StartOptions) (*api.A
 	}
 	id, err := m.Runtime.Run(ctx, runCfg)
 	if err != nil {
+		if m.PortPool != nil {
+			m.PortPool.Release(opts.Name)
+		}
 		// Provisioning writes agent-info.json in "created" state before the
 		// runtime launch. If the launch itself fails, keep the provisioned
 		// workspace but flip the local state to "error" so list/status do not
