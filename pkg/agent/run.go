@@ -974,6 +974,9 @@ func (m *AgentManager) Start(ctx context.Context, opts api.StartOptions) (*api.A
 					// Try to get logs for diagnosis
 					logs, _ := m.Runtime.GetLogs(ctx, id)
 					_ = m.Runtime.Delete(ctx, id)
+					if m.PortPool != nil {
+						m.PortPool.Release(opts.Name)
+					}
 					return nil, fmt.Errorf("container started but exited immediately (status: %s). Container logs:\n%s", a.ContainerStatus, logs)
 				}
 				a.Detached = detached
