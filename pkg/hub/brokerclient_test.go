@@ -27,23 +27,22 @@ import (
 
 	"github.com/GoogleCloudPlatform/scion/pkg/apiclient"
 	"github.com/GoogleCloudPlatform/scion/pkg/store"
-	"github.com/GoogleCloudPlatform/scion/pkg/store/sqlite"
 )
 
 func TestAuthenticatedBrokerClient_CreateAgent(t *testing.T) {
 	// Create a test store with a broker secret
-	db, err := sqlite.New(":memory:")
+	db, err := newTestStore(":memory:")
 	if err != nil {
 		t.Fatalf("failed to create test store: %v", err)
 	}
-	defer db.Close()
+	defer func() { _ = db.Close() }()
 
 	if err := db.Migrate(context.Background()); err != nil {
 		t.Fatalf("failed to migrate: %v", err)
 	}
 
 	// Create a test broker
-	brokerID := "test-host-123"
+	brokerID := tid("test-host-123")
 	secretKey := []byte("test-secret-key-32-bytes-long!!!")
 
 	broker := &store.RuntimeBroker{
@@ -101,13 +100,13 @@ func TestAuthenticatedBrokerClient_CreateAgent(t *testing.T) {
 		resp := &RemoteAgentResponse{
 			Created: true,
 			Agent: &RemoteAgentInfo{
-				ID:     "agent-1",
+				ID:     tid("agent-1"),
 				Name:   "test-agent",
 				Status: "created",
 			},
 		}
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(resp)
+		_ = json.NewEncoder(w).Encode(resp)
 	}))
 	defer server.Close()
 
@@ -116,9 +115,9 @@ func TestAuthenticatedBrokerClient_CreateAgent(t *testing.T) {
 
 	// Make request
 	req := &RemoteCreateAgentRequest{
-		Slug:      "agent-1",
+		Slug:      tid("agent-1"),
 		Name:      "test-agent",
-		ProjectID: "project-1",
+		ProjectID: tid("project-1"),
 	}
 
 	resp, err := client.CreateAgent(context.Background(), brokerID, server.URL, req)
@@ -146,18 +145,18 @@ func TestAuthenticatedBrokerClient_CreateAgent(t *testing.T) {
 
 func TestAuthenticatedBrokerClient_StartAgent(t *testing.T) {
 	// Create a test store with a broker secret
-	db, err := sqlite.New(":memory:")
+	db, err := newTestStore(":memory:")
 	if err != nil {
 		t.Fatalf("failed to create test store: %v", err)
 	}
-	defer db.Close()
+	defer func() { _ = db.Close() }()
 
 	if err := db.Migrate(context.Background()); err != nil {
 		t.Fatalf("failed to migrate: %v", err)
 	}
 
 	// Create a test broker
-	brokerID := "test-host-456"
+	brokerID := tid("test-host-456")
 	secretKey := []byte("another-secret-key-32-bytes!!!!!")
 
 	broker := &store.RuntimeBroker{
@@ -204,7 +203,7 @@ func TestAuthenticatedBrokerClient_StartAgent(t *testing.T) {
 			},
 		}
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(resp)
+		_ = json.NewEncoder(w).Encode(resp)
 	}))
 	defer server.Close()
 
@@ -212,7 +211,7 @@ func TestAuthenticatedBrokerClient_StartAgent(t *testing.T) {
 	client := NewAuthenticatedBrokerClient(db, false)
 
 	// Make request
-	resp, err := client.StartAgent(context.Background(), brokerID, server.URL, "my-agent", "", "", "", "", "", nil, nil, nil, nil, false)
+	resp, err := client.StartAgent(context.Background(), brokerID, server.URL, "my-agent", "", "", "", "", "", nil, nil, nil, nil, false, false)
 	if err != nil {
 		t.Fatalf("StartAgent failed: %v", err)
 	}
@@ -235,23 +234,23 @@ func TestAuthenticatedBrokerClient_StartAgent(t *testing.T) {
 
 func TestAuthenticatedBrokerClient_MissingSecretFailsClosed(t *testing.T) {
 	// Create a test store without a secret
-	db, err := sqlite.New(":memory:")
+	db, err := newTestStore(":memory:")
 	if err != nil {
 		t.Fatalf("failed to create test store: %v", err)
 	}
-	defer db.Close()
+	defer func() { _ = db.Close() }()
 
 	if err := db.Migrate(context.Background()); err != nil {
 		t.Fatalf("failed to migrate: %v", err)
 	}
 
 	// Create a test broker without a secret
-	brokerID := "test-host-no-secret"
+	brokerID := tid("test-host-no-secret")
 
 	broker := &store.RuntimeBroker{
 		ID:      brokerID,
-		Name:    "test-host-no-secret",
-		Slug:    "test-host-no-secret",
+		Name:    tid("test-host-no-secret"),
+		Slug:    tid("test-host-no-secret"),
 		Status:  store.BrokerStatusOnline,
 		Created: time.Now(),
 		Updated: time.Now(),
@@ -274,9 +273,9 @@ func TestAuthenticatedBrokerClient_MissingSecretFailsClosed(t *testing.T) {
 
 	// Make request - should fail before sending anything
 	req := &RemoteCreateAgentRequest{
-		Slug:      "agent-1",
+		Slug:      tid("agent-1"),
 		Name:      "test-agent",
-		ProjectID: "project-1",
+		ProjectID: tid("project-1"),
 	}
 
 	_, err = client.CreateAgent(context.Background(), brokerID, server.URL, req)
@@ -293,24 +292,24 @@ func TestAuthenticatedBrokerClient_MissingSecretFailsClosed(t *testing.T) {
 
 func TestAuthenticatedBrokerClient_ExpiredSecretFailsClosed(t *testing.T) {
 	// Create a test store with an expired secret
-	db, err := sqlite.New(":memory:")
+	db, err := newTestStore(":memory:")
 	if err != nil {
 		t.Fatalf("failed to create test store: %v", err)
 	}
-	defer db.Close()
+	defer func() { _ = db.Close() }()
 
 	if err := db.Migrate(context.Background()); err != nil {
 		t.Fatalf("failed to migrate: %v", err)
 	}
 
 	// Create a test broker with expired secret
-	brokerID := "test-host-expired"
+	brokerID := tid("test-host-expired")
 	secretKey := []byte("expired-secret-key-32-bytes!!!!!")
 
 	broker := &store.RuntimeBroker{
 		ID:      brokerID,
-		Name:    "test-host-expired",
-		Slug:    "test-host-expired",
+		Name:    tid("test-host-expired"),
+		Slug:    tid("test-host-expired"),
 		Status:  store.BrokerStatusOnline,
 		Created: time.Now(),
 		Updated: time.Now(),
@@ -345,9 +344,9 @@ func TestAuthenticatedBrokerClient_ExpiredSecretFailsClosed(t *testing.T) {
 
 	// Make request - should fail before sending due to expired secret
 	req := &RemoteCreateAgentRequest{
-		Slug:      "agent-1",
+		Slug:      tid("agent-1"),
 		Name:      "test-agent",
-		ProjectID: "project-1",
+		ProjectID: tid("project-1"),
 	}
 
 	_, err = client.CreateAgent(context.Background(), brokerID, server.URL, req)
@@ -363,21 +362,21 @@ func TestAuthenticatedBrokerClient_ExpiredSecretFailsClosed(t *testing.T) {
 }
 
 func TestAuthenticatedBrokerClient_StartAgent_InvalidJSONFails(t *testing.T) {
-	db, err := sqlite.New(":memory:")
+	db, err := newTestStore(":memory:")
 	if err != nil {
 		t.Fatalf("failed to create test store: %v", err)
 	}
-	defer db.Close()
+	defer func() { _ = db.Close() }()
 
 	if err := db.Migrate(context.Background()); err != nil {
 		t.Fatalf("failed to migrate: %v", err)
 	}
 
-	brokerID := "test-host-invalid-json"
+	brokerID := tid("test-host-invalid-json")
 	broker := &store.RuntimeBroker{
 		ID:      brokerID,
-		Name:    "test-host-invalid-json",
-		Slug:    "test-host-invalid-json",
+		Name:    tid("test-host-invalid-json"),
+		Slug:    tid("test-host-invalid-json"),
 		Status:  store.BrokerStatusOnline,
 		Created: time.Now(),
 		Updated: time.Now(),
@@ -405,7 +404,7 @@ func TestAuthenticatedBrokerClient_StartAgent_InvalidJSONFails(t *testing.T) {
 	defer server.Close()
 
 	client := NewAuthenticatedBrokerClient(db, false)
-	_, err = client.StartAgent(context.Background(), brokerID, server.URL, "agent-1", "", "", "", "", "", nil, nil, nil, nil, false)
+	_, err = client.StartAgent(context.Background(), brokerID, server.URL, tid("agent-1"), "", "", "", "", "", nil, nil, nil, nil, false, false)
 	if err == nil {
 		t.Fatal("expected StartAgent to fail on invalid JSON response")
 	}
@@ -416,24 +415,24 @@ func TestAuthenticatedBrokerClient_StartAgent_InvalidJSONFails(t *testing.T) {
 
 func TestAuthenticatedBrokerClient_AllOperations(t *testing.T) {
 	// Create a test store with a broker secret
-	db, err := sqlite.New(":memory:")
+	db, err := newTestStore(":memory:")
 	if err != nil {
 		t.Fatalf("failed to create test store: %v", err)
 	}
-	defer db.Close()
+	defer func() { _ = db.Close() }()
 
 	if err := db.Migrate(context.Background()); err != nil {
 		t.Fatalf("failed to migrate: %v", err)
 	}
 
 	// Create a test broker
-	brokerID := "test-host-ops"
+	brokerID := tid("test-host-ops")
 	secretKey := []byte("ops-test-secret-key-32-bytes!!!!")
 
 	broker := &store.RuntimeBroker{
 		ID:      brokerID,
-		Name:    "test-host-ops",
-		Slug:    "test-host-ops",
+		Name:    tid("test-host-ops"),
+		Slug:    tid("test-host-ops"),
 		Status:  store.BrokerStatusOnline,
 		Created: time.Now(),
 		Updated: time.Now(),
@@ -468,7 +467,7 @@ func TestAuthenticatedBrokerClient_AllOperations(t *testing.T) {
 		switch {
 		case r.URL.Path == "/api/v1/agents" && r.Method == "POST":
 			resp := &RemoteAgentResponse{Created: true}
-			json.NewEncoder(w).Encode(resp)
+			_ = json.NewEncoder(w).Encode(resp)
 		case r.URL.Path == "/api/v1/agents/test-agent/start" && r.Method == "POST":
 			resp := &RemoteAgentResponse{
 				Agent: &RemoteAgentInfo{
@@ -477,7 +476,7 @@ func TestAuthenticatedBrokerClient_AllOperations(t *testing.T) {
 					Phase: "running",
 				},
 			}
-			json.NewEncoder(w).Encode(resp)
+			_ = json.NewEncoder(w).Encode(resp)
 		default:
 			w.WriteHeader(http.StatusOK)
 		}
@@ -493,7 +492,7 @@ func TestAuthenticatedBrokerClient_AllOperations(t *testing.T) {
 		t.Errorf("CreateAgent failed: %v", err)
 	}
 
-	_, err = client.StartAgent(ctx, brokerID, server.URL, "test-agent", "", "", "", "", "", nil, nil, nil, nil, false)
+	_, err = client.StartAgent(ctx, brokerID, server.URL, "test-agent", "", "", "", "", "", nil, nil, nil, nil, false, false)
 	if err != nil {
 		t.Errorf("StartAgent failed: %v", err)
 	}

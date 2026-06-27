@@ -224,8 +224,8 @@ func (s *Server) handleWellKnownAgentCard(w http.ResponseWriter, r *http.Request
 		"url":         s.config.Bridge.ExternalURL,
 		"version":     "1.0.0",
 		"capabilities": map[string]bool{
-			"streaming":         false,
-			"pushNotifications": false,
+			"streaming":         true,
+			"pushNotifications": true,
 		},
 	}
 
@@ -366,7 +366,7 @@ func (s *Server) handleSendMessage(w http.ResponseWriter, r *http.Request, req J
 		blocking = *params.Configuration.Blocking
 	}
 
-	result, err := s.bridge.SendMessage(r.Context(), projectSlug, agentSlug, params.ContextID, params.Message.Parts, blocking)
+	result, err := s.bridge.SendMessage(r.Context(), projectSlug, agentSlug, params.ContextID, params.TaskID, params.Message.Parts, blocking)
 	if err != nil {
 		s.log.Error("SendMessage failed", "error", err, "project", projectSlug, "agent", agentSlug)
 		switch {
@@ -374,6 +374,8 @@ func (s *Server) handleSendMessage(w http.ResponseWriter, r *http.Request, req J
 			s.writeRPCError(w, req.ID, ErrCodeInvalidParams, "agent not found")
 		case errors.Is(err, ErrContextUnknown):
 			s.writeRPCError(w, req.ID, ErrCodeInvalidParams, "unknown context ID")
+		case errors.Is(err, ErrTaskTerminal):
+			s.writeRPCError(w, req.ID, ErrCodeInvalidParams, "task is in a terminal state")
 		default:
 			s.writeRPCError(w, req.ID, ErrCodeInternalError, "internal error")
 		}
@@ -487,9 +489,6 @@ func (s *Server) handleCancelTask(w http.ResponseWriter, r *http.Request, req JS
 }
 
 func (s *Server) handleStreamMessage(w http.ResponseWriter, r *http.Request, req JSONRPCRequest, projectSlug, agentSlug string) {
-	s.log.Warn("message/stream request received — MVP limitation: streaming treats the first content message as terminal; multi-turn agents will break",
-		"project", projectSlug, "agent", agentSlug)
-
 	var params SendMessageParams
 	if err := json.Unmarshal(req.Params, &params); err != nil {
 		s.log.Warn("invalid StreamMessage params", "error", err)

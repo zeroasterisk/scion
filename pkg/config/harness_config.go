@@ -72,8 +72,16 @@ func LoadHarnessConfigDir(dirPath string) (*HarnessConfigDir, error) {
 		return nil, fmt.Errorf("failed to parse config.yaml: %w", err)
 	}
 
+	name := filepath.Base(absPath)
+	if entry.Name != "" {
+		if entry.Name == "." || entry.Name == ".." || strings.ContainsAny(entry.Name, "/\\") {
+			return nil, fmt.Errorf("invalid name in config.yaml: %q contains path components or separators", entry.Name)
+		}
+		name = entry.Name
+	}
+
 	return &HarnessConfigDir{
-		Name:   filepath.Base(absPath),
+		Name:   name,
 		Path:   absPath,
 		Config: entry,
 	}, nil
@@ -271,7 +279,7 @@ func mapEmbedFileToHarnessConfigPath(targetDir, homeDir, configDir, fileName str
 }
 
 func isHarnessConfigRootSupportFile(relPath string) bool {
-	if relPath == "provision.py" || relPath == "dialect.yaml" {
+	if relPath == "provision.py" || relPath == "dialect.yaml" || relPath == "capture_auth.py" {
 		return true
 	}
 	for _, prefix := range []string{"schema/", "schemas/", "examples/", "tests/fixtures/"} {
@@ -345,8 +353,16 @@ func ComputeHarnessConfigRevision(dirPath string) string {
 		Hash string
 	}
 	var hashes []fileHash
+	skipBasenames := map[string]bool{
+		"cloudbuild.yaml": true,
+		"README.md":       true,
+		".gitkeep":        true,
+	}
 	walk := func(path string, d fs.DirEntry, walkErr error) error {
 		if walkErr != nil || d.IsDir() {
+			return nil
+		}
+		if skipBasenames[d.Name()] {
 			return nil
 		}
 		rel, relErr := filepath.Rel(dirPath, path)

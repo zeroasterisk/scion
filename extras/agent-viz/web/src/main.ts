@@ -22,6 +22,7 @@ import { FileEditRenderer } from './files';
 import { DestroyBeamRenderer } from './destroy-beam';
 import { CreateBeamRenderer } from './create-beam';
 import { PlaybackControls } from './playback';
+import { CommsPanel } from './comms';
 import type {
   PlaybackManifest,
   PlaybackEvent,
@@ -41,10 +42,31 @@ let fileEditRenderer: FileEditRenderer;
 let destroyBeamRenderer: DestroyBeamRenderer;
 let createBeamRenderer: CreateBeamRenderer;
 let playbackControls: PlaybackControls;
+let commsPanel: CommsPanel;
 let overlayCanvas: HTMLCanvasElement;
 let overlayCtx: CanvasRenderingContext2D;
 let animFrameId: number;
 let manifest: PlaybackManifest | null = null;
+
+// Per-agent colour overrides set from the Agents filter panel, persisted by agent NAME so they
+// survive reloads + carry across runs of the same team.
+const COLOR_OVERRIDE_KEY = 'agentviz_agent_colors';
+function loadColorOverrides(): Record<string, string> {
+  try {
+    return JSON.parse(localStorage.getItem(COLOR_OVERRIDE_KEY) || '{}');
+  } catch {
+    return {};
+  }
+}
+function saveColorOverride(name: string, color: string): void {
+  const o = loadColorOverrides();
+  o[name] = color;
+  try {
+    localStorage.setItem(COLOR_OVERRIDE_KEY, JSON.stringify(o));
+  } catch {
+    /* storage unavailable — override stays in-memory for this session */
+  }
+}
 
 /**
  * Clamp a file path to the configured max depth.
@@ -87,10 +109,23 @@ function init(): void {
   destroyBeamRenderer.setAgentRing(agentRing);
   createBeamRenderer.setAgentRing(agentRing);
 
+  // Agent Communications transcript panel — consumes the same message events.
+  commsPanel = new CommsPanel();
+  commsPanel.setAgentRing(agentRing);
+
   // WebSocket
   const ws = new WSClient();
   playbackControls = new PlaybackControls(controlsContainer, ws);
   playbackControls.setOnShowFileLabelsChange((show) => fileGraph.setShowLabels(show));
+  // Per-agent colour override (Agents filter panel) — recolour the ring live + persist by name.
+  playbackControls.setOnAgentColorChange((id, name, color) => {
+    agentRing.setAgentColor(id, color);
+    saveColorOverride(name, color);
+    // Update every matching manifest entry so later resolveAgentInfo() lookups stay consistent.
+    manifest?.agents.forEach((a) => {
+      if (a.id === id || a.name === name) a.color = color;
+    });
+  });
 
   ws.onMessage((msg) => {
     if ('type' in msg) {
@@ -129,6 +164,12 @@ function init(): void {
 
 function handleManifest(m: PlaybackManifest): void {
   manifest = m;
+  // Apply saved per-agent colour overrides to the manifest so BOTH the ring (via resolveAgentInfo)
+  // and the filter dots pick them up.
+  const overrides = loadColorOverrides();
+  for (const a of m.agents) {
+    if (overrides[a.name]) a.color = overrides[a.name];
+  }
   console.log('[agent-viz] Manifest received:', {
     agents: m.agents.length,
     files: m.files.length,
@@ -156,6 +197,10 @@ function handleManifest(m: PlaybackManifest): void {
   // Set up playback controls
   playbackControls.setTimeRange(m.timeRange.start, m.timeRange.end);
   playbackControls.setAgents(m.agents);
+
+  // Anchor relative timestamps in the communications panel to playback start.
+  commsPanel.setStartTime(m.timeRange.start);
+  commsPanel.reset();
 
   // Update info display
   updateInfoDisplay();
@@ -187,6 +232,7 @@ function resetState(): void {
   fileEditRenderer.reset();
   destroyBeamRenderer.reset();
   createBeamRenderer.reset();
+  commsPanel.reset();
 
   // Re-init empty state
   const w = overlayCanvas.width;
@@ -201,7 +247,9 @@ function handleEventInstant(evt: PlaybackEvent): void {
       agentRing.updateState(evt.data as AgentStateEvent);
       break;
     case 'message':
-      // Skip message animations during replay
+      // Skip the on-graph pulse animation during replay, but still record the
+      // message in the transcript so the panel reflects the seek position.
+      commsPanel.addMessage(evt.data as MessageEvent, evt.timestamp, { animate: false });
       break;
     case 'file_edit':
     case 'file_read': {
@@ -248,6 +296,7 @@ function handleEvent(evt: PlaybackEvent): void {
       break;
     case 'message':
       messageRenderer.addMessage(evt.data as MessageEvent, agentRing);
+      commsPanel.addMessage(evt.data as MessageEvent, evt.timestamp);
       break;
     case 'file_edit':
     case 'file_read': {

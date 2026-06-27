@@ -160,7 +160,7 @@ func (s *Server) executeMigration(w http.ResponseWriter, r *http.Request, key st
 	// Parse request body for params.
 	var body map[string]interface{}
 	if r.Body != nil {
-		defer r.Body.Close()
+		defer func() { _ = r.Body.Close() }()
 		_ = json.NewDecoder(r.Body).Decode(&body)
 	}
 	params := parseMigrationParams(body)
@@ -293,6 +293,16 @@ func (s *Server) resolveMaintenanceExecutor(key string) (MaintenanceExecutor, er
 		return &RebuildContainerBinariesExecutor{
 			repoPath: mc.RepoPath,
 		}, nil
+	case "build-harness-config-image":
+		log.Debug("Resolved build-harness-config-image executor",
+			"runtime_bin", mc.RuntimeBin, "registry", mc.ImageRegistry, "tag", mc.ImageTag)
+		return &BuildHarnessConfigImageExecutor{
+			store:      s.store,
+			storage:    s.GetStorage(),
+			runtimeBin: mc.RuntimeBin,
+			registry:   mc.ImageRegistry,
+			tag:        mc.ImageTag,
+		}, nil
 	default:
 		return nil, fmt.Errorf("no executor registered for operation %q", key)
 	}
@@ -328,7 +338,7 @@ func (s *Server) executeOperation(w http.ResponseWriter, r *http.Request, key st
 	// Parse request body for params.
 	var body map[string]interface{}
 	if r.Body != nil {
-		defer r.Body.Close()
+		defer func() { _ = r.Body.Close() }()
 		_ = json.NewDecoder(r.Body).Decode(&body)
 	}
 	params := parseMigrationParams(body) // reuse same param parser

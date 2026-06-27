@@ -50,6 +50,8 @@ const NAV_SECTIONS: NavSection[] = [
       { path: '/projects', label: 'Projects', icon: 'folder' },
       { path: '/agents', label: 'Agents', icon: 'cpu' },
       { path: '/brokers', label: 'Brokers', icon: 'hdd-rack' },
+      { path: '/skills', label: 'Skills', icon: 'lightning-charge' },
+      { path: '/metrics', label: 'Metrics', icon: 'graph-up' },
     ],
   },
 ];
@@ -66,6 +68,7 @@ const ADMIN_SECTION: NavSection = {
     { path: '/admin/users', label: 'Users', icon: 'people' },
     { path: '/admin/groups', label: 'Groups', icon: 'diagram-3' },
     { path: '/admin/maintenance', label: 'Maintenance', icon: 'wrench-adjustable' },
+    { path: '/admin/skill-registries', label: 'Skill Registries', icon: 'cloud-arrow-down' },
   ],
 };
 

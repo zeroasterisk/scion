@@ -189,9 +189,15 @@ func (s *Server) handleAgentMessages(w http.ResponseWriter, r *http.Request, age
 		opts.Cursor = cursor
 	}
 
+	// Users who can manage the agent (owners, project admins, global admins)
+	// see all messages including those from chat integrations. Other users
+	// only see messages where they are a participant, preserving privacy.
 	filter := store.MessageFilter{
-		AgentID:       agentID,
-		ParticipantID: user.ID(),
+		AgentID: agentID,
+	}
+	canManage := s.authzService.CheckAccess(ctx, user, agentResource(agent), ActionManage)
+	if !canManage.Allowed {
+		filter.ParticipantID = user.ID()
 	}
 
 	result, err := s.store.ListMessages(ctx, filter, opts)
@@ -204,8 +210,8 @@ func (s *Server) handleAgentMessages(w http.ResponseWriter, r *http.Request, age
 }
 
 // handleAgentMessagesStream handles GET /api/v1/agents/{id}/messages/stream.
-// Streams new messages involving a specific agent in real time, scoped to
-// the conversation between the current authenticated user and the agent.
+// Streams new messages involving a specific agent in real time. Users who
+// can manage the agent see all messages; others see only their own.
 // Unlike /message-logs/stream this does not depend on Cloud Logging: it
 // subscribes to the in-process event bus that handleAgentOutboundMessage
 // and handleAgentMessage already publish to, so it works on any hub
@@ -216,15 +222,16 @@ func (s *Server) handleAgentMessagesStream(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
-	// The event bus is an interface; only ChannelEventPublisher supports
-	// subscription. Check this before hitting the store so noop-publisher
-	// hubs fail fast without a wasted DB roundtrip.
-	ep, ok := s.events.(*ChannelEventPublisher)
-	if !ok {
+	// Real-time streaming requires a subscription-capable EventPublisher
+	// (ChannelEventPublisher or PostgresEventPublisher). The no-op publisher
+	// returns a nil channel, so fail fast before hitting the store to avoid a
+	// wasted DB roundtrip on hubs without a configured publisher.
+	if _, isNoop := s.events.(noopEventPublisher); isNoop || s.events == nil {
 		writeError(w, http.StatusNotImplemented, "not_implemented",
 			"Real-time message streaming is not available on this hub", nil)
 		return
 	}
+	ep := s.events
 
 	ctx := r.Context()
 	user := GetUserIdentityFromContext(ctx)
@@ -268,7 +275,12 @@ func (s *Server) handleAgentMessagesStream(w http.ResponseWriter, r *http.Reques
 	ch, unsubscribe := ep.Subscribe("agent." + agent.ID + ".message")
 	defer unsubscribe()
 
+	// Users who can manage the agent see all messages; others only see
+	// messages where they are a participant.
 	userID := user.ID()
+	canManage := s.authzService.CheckAccess(ctx, user, agentResource(agent), ActionManage)
+	filterStream := !canManage.Allowed
+
 	heartbeat := time.NewTicker(30 * time.Second)
 	defer heartbeat.Stop()
 
@@ -283,23 +295,22 @@ func (s *Server) handleAgentMessagesStream(w http.ResponseWriter, r *http.Reques
 			if !ok {
 				return
 			}
-			// Filter: only forward events where the current user is a
-			// participant. Without this the stream would include messages
-			// from every other user's conversation with this agent.
-			var payload UserMessageEvent
-			if err := json.Unmarshal(evt.Data, &payload); err != nil {
-				continue
+			if filterStream {
+				var payload UserMessageEvent
+				if err := json.Unmarshal(evt.Data, &payload); err != nil {
+					continue
+				}
+				if payload.SenderID != userID && payload.RecipientID != userID {
+					continue
+				}
 			}
-			if payload.SenderID != userID && payload.RecipientID != userID {
-				continue
-			}
-			fmt.Fprintf(w, "event: message\ndata: %s\n\n", evt.Data)
+			_, _ = fmt.Fprintf(w, "event: message\ndata: %s\n\n", evt.Data)
 			flusher.Flush()
 		case <-heartbeat.C:
-			fmt.Fprintf(w, ":heartbeat %d\n\n", time.Now().UnixMilli())
+			_, _ = fmt.Fprintf(w, ":heartbeat %d\n\n", time.Now().UnixMilli())
 			flusher.Flush()
 		case <-timeout.C:
-			fmt.Fprintf(w, "event: timeout\ndata: {\"message\":\"stream timeout, please reconnect\"}\n\n")
+			_, _ = fmt.Fprintf(w, "event: timeout\ndata: {\"message\":\"stream timeout, please reconnect\"}\n\n")
 			flusher.Flush()
 			return
 		case <-ctx.Done():

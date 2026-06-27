@@ -26,6 +26,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/GoogleCloudPlatform/scion/extras/scion-a2a-bridge/internal/state"
+	"github.com/GoogleCloudPlatform/scion/pkg/projectcompat"
 )
 
 // ErrTooManySubscribers is returned when the SSE connection limit is reached.
@@ -220,7 +221,7 @@ func (b *Bridge) SendStreamingMessage(ctx context.Context, projectSlug, agentSlu
 	scionMsg.Metadata = map[string]string{"a2aTaskId": taskID}
 
 	if b.broker != nil {
-		pattern := fmt.Sprintf("scion.project.%s.user.%s.messages", agentCtx.ProjectID, b.config.Hub.User)
+		pattern := projectcompat.UserTopic(agentCtx.ProjectID, b.config.Hub.User)
 		if err := b.broker.RequestSubscription(pattern); err != nil {
 			b.log.Warn("failed to request subscription", "pattern", pattern, "error", err)
 		}
@@ -232,7 +233,7 @@ func (b *Bridge) SendStreamingMessage(ctx context.Context, projectSlug, agentSlu
 		sendCtx, cancel := context.WithTimeout(b.shutdownCtx, 30*time.Second)
 		defer cancel()
 
-		if err := b.hubClient.Agents().SendStructuredMessage(sendCtx, agentCtx.AgentID, scionMsg, false, false, false); err != nil {
+		if _, err := b.hubClient.Agents().SendStructuredMessage(sendCtx, agentCtx.AgentID, scionMsg, false, false, false); err != nil {
 			b.log.Error("streaming send failed", "error", err, "task_id", taskID)
 			if err := b.store.UpdateTaskState(taskID, TaskStateFailed); err != nil {
 				b.log.Error("failed to update task state", "error", err, "task_id", taskID)

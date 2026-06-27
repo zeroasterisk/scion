@@ -17,6 +17,9 @@ package harness
 import (
 	"context"
 	"fmt"
+	"log/slog"
+	"os"
+	"path/filepath"
 
 	"github.com/GoogleCloudPlatform/scion/pkg/api"
 	"github.com/GoogleCloudPlatform/scion/pkg/config"
@@ -37,6 +40,7 @@ type ResolveOptions struct {
 	TemplatePaths []string                  // optional template dirs (highest priority)
 	ProfileName   string                    // active profile (for settings overlay)
 	Settings      *config.VersionedSettings // optional settings overlay
+	ConfigDirPath string                    // explicit harness-config dir (Hub-hydrated path); takes priority over name-based lookup
 }
 
 // ResolvedHarness is the result of harness.Resolve. The selected
@@ -64,7 +68,13 @@ func Resolve(_ context.Context, opts ResolveOptions) (*ResolvedHarness, error) {
 		return nil, fmt.Errorf("harness.Resolve requires a name")
 	}
 
-	hcDir, hcErr := config.FindHarnessConfigDir(opts.Name, opts.ProjectPath, opts.TemplatePaths...)
+	var hcDir *config.HarnessConfigDir
+	var hcErr error
+	if opts.ConfigDirPath != "" {
+		hcDir, hcErr = config.LoadHarnessConfigDir(opts.ConfigDirPath)
+	} else {
+		hcDir, hcErr = config.FindHarnessConfigDir(opts.Name, opts.ProjectPath, opts.TemplatePaths...)
+	}
 
 	entry := config.HarnessConfigEntry{Harness: opts.Name}
 	if hcDir != nil {
@@ -110,6 +120,19 @@ func Resolve(_ context.Context, opts ResolveOptions) (*ResolvedHarness, error) {
 		}, nil
 	}
 
+	if entry.Harness == "opencode" || entry.Harness == "codex" {
+		if hcDir == nil {
+			slog.Warn("harness is not installed; run: scion harness-config install harnesses/"+entry.Harness, "harness", entry.Harness)
+		} else if entry.Provisioner == nil || entry.Provisioner.Type != "container-script" {
+			hint := "run: scion harness-config upgrade " + opts.Name + " --activate-script"
+			if !fileExistsInDir(hcDir.Path, "provision.py") {
+				hint = "run: scion harness-config install harnesses/" + entry.Harness
+			}
+			slog.Warn("legacy built-in harness config no longer has a compiled-in implementation; "+hint,
+				"harness", entry.Harness, "config_dir", hcDir.Path)
+		}
+	}
+
 	// 3. Declarative generic. If config.yaml has declarative metadata
 	// (command/env_template/capabilities), use the declarative wrapper so
 	// callers get those fields. Otherwise fall back to the legacy Generic.
@@ -140,10 +163,6 @@ func newBuiltin(harnessName string) api.Harness {
 		return &ClaudeCode{}
 	case "gemini":
 		return &GeminiCLI{}
-	case "opencode":
-		return &OpenCode{}
-	case "codex":
-		return &Codex{}
 	}
 	return nil
 }
@@ -188,6 +207,11 @@ func mergeHarnessConfigEntries(base, overlay config.HarnessConfigEntry) config.H
 		base.Secrets = overlay.Secrets
 	}
 	return base
+}
+
+func fileExistsInDir(dir, name string) bool {
+	_, err := os.Stat(filepath.Join(dir, name))
+	return err == nil
 }
 
 func hasDeclarativeMetadata(entry config.HarnessConfigEntry) bool {

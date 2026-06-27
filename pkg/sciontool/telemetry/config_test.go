@@ -448,11 +448,10 @@ func TestLoadConfig_GCPDefaults(t *testing.T) {
 
 	cfg := LoadConfig()
 
-	// Note: GCPCredentialsFile may be non-empty if the well-known path exists
-	// in the test environment's home directory. Only assert CloudProvider is
-	// empty when no credentials are present.
+	// CloudProvider is auto-detected when a credentials file exists at the
+	// well-known path. Only assert it is empty when no credentials are found.
 	if cfg.GCPCredentialsFile == "" && cfg.CloudProvider != "" {
-		t.Errorf("Expected CloudProvider to be empty when no credentials, got %q", cfg.CloudProvider)
+		t.Errorf("Expected CloudProvider to be empty when no GCP credentials, got %q", cfg.CloudProvider)
 	}
 }
 
@@ -576,4 +575,6 @@ func clearTelemetryEnv() {
 	os.Unsetenv(EnvGCPCredentials)
 	os.Unsetenv(EnvCloudProvider)
 	os.Unsetenv(EnvMetricsDebug)
+	// Mark as sandboxed so LoadConfig's test guard doesn't force-disable cloud.
+	telemetryTestSandboxed = true
 }

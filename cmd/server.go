@@ -29,7 +29,9 @@ var (
 	enableRuntimeBroker bool
 	runtimeBrokerPort   int
 	dbURL               string
+	noAutoMigrate       bool
 	enableDevAuth       bool
+	enableTestLogin     bool
 	enableDebug         bool
 	storageBucket       string
 	storageDir          string
@@ -56,6 +58,7 @@ var (
 
 	// Server daemon flags
 	serverStartForeground bool
+	stopForce             bool
 
 	// Hosted mode flag (replaces former "production" mode)
 	hostedMode bool
@@ -238,6 +241,7 @@ func init() {
 	serverStartCmd.Flags().IntVar(&hubPort, "port", 9810, "Hub API port (standalone mode only; ignored when --enable-web is set, use --web-port instead)")
 	serverStartCmd.Flags().StringVar(&hubHost, "host", "0.0.0.0", "Hub API host to bind")
 	serverStartCmd.Flags().StringVar(&dbURL, "db", "", "Database URL/path")
+	serverStartCmd.Flags().BoolVar(&noAutoMigrate, "no-auto-migrate", false, "Skip automatic in-process upgrade of a legacy raw-SQL hub.db to the Ent schema (operator opt-out)")
 
 	// Runtime Broker API flags
 	serverStartCmd.Flags().BoolVar(&enableRuntimeBroker, "enable-runtime-broker", false, "Enable the Runtime Broker API")
@@ -245,6 +249,7 @@ func init() {
 
 	// Auth flags
 	serverStartCmd.Flags().BoolVar(&enableDevAuth, "dev-auth", false, "Enable development authentication (auto-generates token)")
+	serverStartCmd.Flags().BoolVar(&enableTestLogin, "enable-test-login", false, "Enable the test-login endpoint for integration testing (do not use in production)")
 
 	// Debug flags
 	serverStartCmd.Flags().BoolVar(&enableDebug, "debug", false, "Enable debug logging (verbose output)")
@@ -272,6 +277,9 @@ func init() {
 
 	// Admin bootstrap flags
 	serverStartCmd.Flags().StringVar(&adminEmails, "admin-emails", "", "Comma-separated list of email addresses to auto-promote to admin role")
+
+	// Stop flags
+	serverStopCmd.Flags().BoolVar(&stopForce, "force", false, "Kill any process listening on the server ports, even without a PID file")
 
 	// Status flags
 	serverStatusCmd.Flags().BoolVar(&serverStatusJSON, "json", false, "Output in JSON format")

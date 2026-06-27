@@ -29,6 +29,8 @@ import (
 	"github.com/GoogleCloudPlatform/scion/pkg/api"
 	"github.com/GoogleCloudPlatform/scion/pkg/config"
 	"github.com/GoogleCloudPlatform/scion/pkg/harness"
+	"github.com/GoogleCloudPlatform/scion/pkg/projectcompat"
+	"github.com/GoogleCloudPlatform/scion/pkg/provision"
 	"github.com/GoogleCloudPlatform/scion/pkg/util"
 )
 
@@ -37,12 +39,43 @@ func DeleteAgentFiles(agentName string, projectPath string, removeBranch bool) (
 	branchDeleted := false
 	var repoRoot string
 	var externalAgentDir string
+	var worktreeDir string // worktree-per-agent: agent's worktree path
 	if projectDir, err := config.GetResolvedProjectDir(projectPath); err == nil {
 		agentsDirs = append(agentsDirs, filepath.Join(projectDir, "agents"))
-		// Determine repo root for worktree pruning and branch cleanup
-		if root, err := util.RepoRootDir(filepath.Dir(projectDir)); err == nil {
-			repoRoot = root
+
+		// Determine repo root for worktree pruning and branch cleanup.
+		// For worktree-per-agent the shared base lives at
+		// <projectRoot>/workspace where projectRoot is the actual project
+		// directory. GetResolvedProjectDir may have appended .scion
+		// (e.g. hub-managed projects), so strip that suffix to match the
+		// path the workspace backend used during provisioning.
+		projectRoot := projectDir
+		if filepath.Base(projectDir) == config.DotScion {
+			projectRoot = filepath.Dir(projectDir)
 		}
+		sharedBase := filepath.Join(projectRoot, "workspace")
+		// Accept .git as either a directory (normal clone) or a file (gitdir
+		// pointer, e.g. if the base is itself a linked worktree/submodule) —
+		// existence is enough to identify a valid repo root. (upstream #351 review)
+		if _, statErr := os.Stat(filepath.Join(sharedBase, ".git")); statErr == nil {
+			repoRoot = sharedBase
+			wtPath := filepath.Join(sharedBase, "worktrees", agentName)
+			if _, statErr := os.Stat(wtPath); statErr == nil {
+				worktreeDir = wtPath
+			}
+		}
+
+		// Fallback: resolve repo root from projectDir itself. Passing projectDir
+		// (not its parent) is robust for both local projects (where projectDir is
+		// the repo root) and hub-managed projects (where it is the .scion subdir).
+		// MUST match the base used at sharer registration (ProvisionAgent), or the
+		// refcount lookup (FindBranchForAgent/UnregisterSharer) would miss.
+		if repoRoot == "" {
+			if root, err := util.RepoRootDir(projectDir); err == nil {
+				repoRoot = root
+			}
+		}
+
 		// Check for external agent home (git project split storage)
 		if extDir, err := config.GetGitProjectExternalAgentsDir(projectDir); err == nil && extDir != "" {
 			externalAgentDir = filepath.Join(extDir, agentName)
@@ -58,6 +91,81 @@ func DeleteAgentFiles(agentName string, projectPath string, removeBranch bool) (
 	// in a goroutine that could block git subprocess I/O system-wide.
 	var dirsToDelete []string
 
+	// --- Refcount path: shared-worktree teardown (#168 I3) ---
+	//
+	// Before the legacy worktree-removal blocks, check the sharer registry.
+	// If this agent is registered as a sharer, unregister it and decide
+	// whether to remove the shared worktree based on remaining sharers.
+	//
+	// NOTE: teardown does not hold the per-project advisory lock. The
+	// provisioning path (ensureWorktree / ProvisionShared) holds the lock
+	// during registration. A concurrent provision+delete race on the same
+	// branch is unlikely in practice (the hub serialises agent lifecycle)
+	// but not structurally excluded. Acceptable for single-node local mode
+	// which has no advisory locker.
+	refcountHandled := false
+	if repoRoot != "" {
+		// Do NOT silently swallow registry errors and fall through to the legacy
+		// path — that path could delete the shared worktree out from under live
+		// joiners. On a real registry I/O error, fail loudly instead.
+		branch, _, found, findErr := provision.FindBranchForAgent(repoRoot, agentName)
+		if findErr != nil {
+			return branchDeleted, fmt.Errorf("delete: FindBranchForAgent for %s: %w", agentName, findErr)
+		}
+		if found {
+			remaining, wtPath, unregErr := provision.UnregisterSharer(repoRoot, branch, agentName)
+			if unregErr != nil {
+				return branchDeleted, fmt.Errorf("delete: UnregisterSharer for branch %s agent %s: %w", branch, agentName, unregErr)
+			}
+			if len(remaining) == 0 {
+				util.Debugf("delete: last sharer for branch %s, removing worktree at %s", branch, wtPath)
+				worktreeStart := time.Now()
+				if deleted, err := util.RemoveWorktree(wtPath, removeBranch); err == nil {
+					if deleted {
+						branchDeleted = true
+					}
+					util.Debugf("delete: shared worktree removal completed in %v (branch deleted: %v)", time.Since(worktreeStart), deleted)
+				} else {
+					util.Debugf("delete: shared worktree removal failed in %v: %v", time.Since(worktreeStart), err)
+					_ = util.RemoveAllSafe(wtPath)
+					// Worktree removal failed, so the branch wasn't deleted by it —
+					// fall back to deleting the branch by name (like the legacy path).
+					if removeBranch && !branchDeleted {
+						if util.DeleteBranchIn(repoRoot, branch) {
+							branchDeleted = true
+							util.Debugf("delete: deleted branch %s via fallback after worktree removal failure", branch)
+						}
+					}
+				}
+			} else {
+				util.Debugf("delete: %d sharers remain for branch %s, detaching agent %s", len(remaining), branch, agentName)
+			}
+			refcountHandled = true
+		}
+	}
+
+	// Worktree-per-agent: remove the agent's worktree from the shared base.
+	// The worktree lives at <projectDir>/workspace/worktrees/<agentName>,
+	// separate from the agent config dir under agents/.
+	// Skip when the refcount path already handled removal/detach.
+	if worktreeDir != "" && !refcountHandled {
+		if _, err := os.Stat(filepath.Join(worktreeDir, ".git")); err == nil {
+			util.Debugf("delete: removing worktree-per-agent workspace at %s", worktreeDir)
+			worktreeStart := time.Now()
+			if deleted, err := util.RemoveWorktree(worktreeDir, removeBranch); err == nil {
+				if deleted {
+					branchDeleted = true
+				}
+				util.Debugf("delete: worktree-per-agent removal completed in %v (branch deleted: %v)", time.Since(worktreeStart), deleted)
+			} else {
+				util.Debugf("delete: worktree-per-agent removal failed in %v: %v", time.Since(worktreeStart), err)
+				_ = util.RemoveAllSafe(worktreeDir)
+			}
+		} else {
+			_ = util.RemoveAllSafe(worktreeDir)
+		}
+	}
+
 	for _, dir := range agentsDirs {
 		agentDir := filepath.Join(dir, agentName)
 		if _, err := os.Stat(agentDir); err != nil {
@@ -65,21 +173,22 @@ func DeleteAgentFiles(agentName string, projectPath string, removeBranch bool) (
 		}
 
 		agentWorkspace := filepath.Join(agentDir, "workspace")
-		// Check if it's a worktree before trying to remove it
-		if _, err := os.Stat(filepath.Join(agentWorkspace, ".git")); err == nil {
-			util.Debugf("delete: removing workspace at %s", agentWorkspace)
-			worktreeStart := time.Now()
-			if deleted, err := util.RemoveWorktree(agentWorkspace, removeBranch); err == nil {
-				if deleted {
-					branchDeleted = true
+		// Check if it's a worktree before trying to remove it.
+		// Skip when the refcount path already handled removal/detach —
+		// the shared worktree must not be removed while other sharers remain.
+		if !refcountHandled {
+			if _, err := os.Stat(filepath.Join(agentWorkspace, ".git")); err == nil {
+				util.Debugf("delete: removing workspace at %s", agentWorkspace)
+				worktreeStart := time.Now()
+				if deleted, err := util.RemoveWorktree(agentWorkspace, removeBranch); err == nil {
+					if deleted {
+						branchDeleted = true
+					}
+					util.Debugf("delete: worktree removal completed in %v (branch deleted: %v)", time.Since(worktreeStart), deleted)
+				} else {
+					util.Debugf("delete: worktree removal failed in %v: %v", time.Since(worktreeStart), err)
+					_ = util.RemoveAllSafe(agentWorkspace)
 				}
-				util.Debugf("delete: worktree removal completed in %v (branch deleted: %v)", time.Since(worktreeStart), deleted)
-			} else {
-				util.Debugf("delete: worktree removal failed in %v: %v", time.Since(worktreeStart), err)
-				// Ensure the workspace directory is gone even if worktree
-				// removal only partially succeeded, so that PruneWorktreesIn
-				// can detect the stale .git/worktrees entry.
-				_ = util.RemoveAllSafe(agentWorkspace)
 			}
 		}
 
@@ -97,7 +206,9 @@ func DeleteAgentFiles(agentName string, projectPath string, removeBranch bool) (
 
 		// If the branch wasn't already deleted via RemoveWorktree (e.g. because
 		// the workspace .git file didn't exist), try to delete it by name.
-		if removeBranch && !branchDeleted {
+		// Skip when refcount handled teardown — branch lifecycle is managed
+		// by the refcount path (last-sharer removes; others detach).
+		if removeBranch && !branchDeleted && !refcountHandled {
 			branchName := api.Slugify(agentName)
 			if util.DeleteBranchIn(repoRoot, branchName) {
 				branchDeleted = true
@@ -186,8 +297,8 @@ func migrateLegacyAgentState(legacyDir, externalDir string) {
 // clean up containers before removing the project config directory.
 func StopProjectContainers(ctx context.Context, mgr Manager, projectName string, agentNames []string) []string {
 	containers, err := mgr.List(ctx, map[string]string{
-		"scion.agent": "true",
-		"scion.grove": projectName,
+		"scion.agent":              "true",
+		projectcompat.LabelProject: projectName,
 	})
 	if err != nil {
 		util.Debugf("StopProjectContainers: failed to list containers for project %s: %v", projectName, err)
@@ -425,6 +536,15 @@ func ProvisionAgent(ctx context.Context, agentName string, templateName string, 
 				agentWorkspace = "" // Using external worktree
 				usedExistingWorktree = true
 				fmt.Printf("Warning: Relying on existing worktree for branch '%s' at '%s'\n", targetBranch, existingPath)
+				// Register as sharer for refcounted teardown (I3). Fail loudly:
+				// an untracked agent breaks the refcount (premature/leaked removal).
+				root, rootErr := util.RepoRootDir(projectDir)
+				if rootErr != nil {
+					return "", "", nil, fmt.Errorf("resolve repo root for sharer registration: %w", rootErr)
+				}
+				if regErr := provision.RegisterSharer(root, targetBranch, existingPath, agentName); regErr != nil {
+					return "", "", nil, fmt.Errorf("register sharer (attach): %w", regErr)
+				}
 			}
 		}
 
@@ -471,6 +591,15 @@ func ProvisionAgent(ctx context.Context, agentName string, templateName string, 
 			return "", "", nil, fmt.Errorf("failed to create git worktree: %w", err)
 		}
 		util.Debugf("provision: worktree created in %s", time.Since(worktreeStart))
+		// Register as sharer for refcounted teardown (I3). Fail loudly:
+		// an untracked agent breaks the refcount (premature/leaked removal).
+		root, rootErr := util.RepoRootDir(projectDir)
+		if rootErr != nil {
+			return "", "", nil, fmt.Errorf("resolve repo root for sharer registration: %w", rootErr)
+		}
+		if regErr := provision.RegisterSharer(root, worktreeBranch, agentWorkspace, agentName); regErr != nil {
+			return "", "", nil, fmt.Errorf("register sharer (create): %w", regErr)
+		}
 
 		// Write a .scion project marker into the worktree so in-container CLI
 		// can discover the project context. Worktrees don't contain .scion
@@ -609,6 +738,7 @@ func ProvisionAgent(ctx context.Context, agentName string, templateName string, 
 		TemplatePaths: templatePaths,
 		ProfileName:   profileName,
 		Settings:      settings,
+		ConfigDirPath: api.HarnessConfigPathFromContext(ctx),
 	})
 	if err != nil {
 		return "", "", nil, fmt.Errorf("failed to resolve harness for %q: %w", harnessConfigName, err)
@@ -633,6 +763,116 @@ func ProvisionAgent(ctx context.Context, agentName string, templateName string, 
 		}
 	}
 	util.Debugf("provision: home/skills copy completed in %s", time.Since(homeCopyStart))
+
+	// Step 3d: Resolve and install referenced skills from skill bank
+	var resolvedSkillsRecord *SkillResolutionRecord
+	if len(finalScionCfg.Skills) > 0 {
+		resolver := SkillResolverFromContext(ctx)
+		if resolver == nil {
+			// S1: Fail closed for required skills
+			requiredURIs := collectRequiredSkillURIs(finalScionCfg.Skills)
+			if len(requiredURIs) > 0 {
+				return "", "", nil, fmt.Errorf(
+					"skill resolution failed: %d required skill(s) declared but no skill resolver available\n"+
+						"  skills: %s\n"+
+						"  hint: connect to a Hub or mark skills as optional",
+					len(requiredURIs), strings.Join(requiredURIs, ", "))
+			}
+			util.Debugf("provision: %d optional skill(s) declared but no resolver available, skipping", len(finalScionCfg.Skills))
+		} else {
+			projectID := ResolveProjectIDFromContext(ctx)
+			if projectID == "" {
+				projectID, _ = config.ReadProjectID(projectDir)
+			}
+			resolveOpts := ResolveOpts{
+				ProjectID: projectID,
+				UserID:    ResolveUserIDFromContext(ctx),
+			}
+
+			result, err := resolver.Resolve(ctx, finalScionCfg.Skills, resolveOpts)
+			if err != nil {
+				return "", "", nil, fmt.Errorf("skill resolution failed: %w", err)
+			}
+
+			// S1 completeness: build requested URI set
+			requestedURIs := make(map[string]*api.SkillReference, len(finalScionCfg.Skills))
+			for i := range finalScionCfg.Skills {
+				requestedURIs[finalScionCfg.Skills[i].URI] = &finalScionCfg.Skills[i]
+			}
+
+			resolvedURIs := make(map[string]bool)
+			errorURIs := make(map[string]bool)
+
+			for _, rs := range result.Resolved {
+				if _, ok := requestedURIs[rs.URI]; !ok {
+					return "", "", nil, fmt.Errorf(
+						"resolver returned unrequested skill %q — possible resolver bug or injection", rs.URI)
+				}
+				if resolvedURIs[rs.URI] {
+					return "", "", nil, fmt.Errorf(
+						"resolver returned duplicate resolved skill %q", rs.URI)
+				}
+				resolvedURIs[rs.URI] = true
+			}
+
+			for _, re := range result.Errors {
+				errorURIs[re.URI] = true
+				ref := requestedURIs[re.URI]
+				if ref == nil || !ref.Optional {
+					return "", "", nil, fmt.Errorf(
+						"required skill %q could not be resolved: %s", re.URI, re.Message)
+				}
+				util.Debugf("provision: optional skill %q skipped: %s", re.URI, re.Message)
+			}
+
+			// S1: verify every requested URI has an outcome
+			for uri, ref := range requestedURIs {
+				if !resolvedURIs[uri] && !errorURIs[uri] {
+					if ref.Optional {
+						util.Debugf("provision: optional skill %q missing from resolver response, skipping", uri)
+					} else {
+						return "", "", nil, fmt.Errorf(
+							"required skill %q missing from resolver response — S1 fail-closed", uri)
+					}
+				}
+			}
+
+			// Capture local skills before installing registry skills (M2: avoid duplication)
+			var localSkills []SkillResolutionEntry
+			if skillsDir != "" {
+				localSkills = enumerateLocalSkills(agentHome, skillsDir)
+			}
+
+			if len(result.Resolved) > 0 {
+				if skillsDir == "" {
+					return "", "", nil, fmt.Errorf("harness does not support skills (no skills directory configured)")
+				}
+				skillsDest := filepath.Join(agentHome, skillsDir)
+				record, err := installResolvedSkills(ctx, result.Resolved, skillsDest, agentHome)
+				if err != nil {
+					return "", "", nil, fmt.Errorf("skill installation failed: %w", err)
+				}
+				record.Resolver = resolverName(resolver)
+				record.Skills = append(localSkills, record.Skills...)
+				resolvedSkillsRecord = record
+			}
+		}
+	}
+
+	// Write resolution record (S4)
+	if resolvedSkillsRecord != nil {
+		recordPath := filepath.Join(agentHome, ".scion", "resolved-skills.json")
+		if err := writeResolutionRecord(recordPath, resolvedSkillsRecord); err != nil {
+			util.Debugf("provision: failed to write resolution record: %v", err)
+		}
+
+		// Stage resolved-skills.json for container-script harnesses
+		recordData, _ := json.MarshalIndent(resolvedSkillsRecord, "", "  ")
+		inputPath := filepath.Join(agentHome, ".scion", "harness", "inputs", "resolved-skills.json")
+		if info, err := os.Stat(filepath.Dir(inputPath)); err == nil && info.IsDir() {
+			_ = os.WriteFile(inputPath, recordData, 0644)
+		}
+	}
 
 	// Step 4: Inject agent instructions
 
@@ -903,6 +1143,16 @@ func ProvisionAgent(ctx context.Context, agentName string, templateName string, 
 	// 3. Harness provisioning
 	if err := h.Provision(ctx, agentName, agentDir, agentHome, agentWorkspace); err != nil {
 		return "", "", nil, fmt.Errorf("harness provisioning failed: %w", err)
+	}
+
+	// Stage capture-auth assets (capture_auth.py + capture-auth-config.json)
+	// into the harness bundle so they are available at a known path in the
+	// container. Container-script harnesses stage these during their own
+	// Provision(); for builtin harnesses this is the only staging opportunity.
+	if _, isContainerScript := h.(*harness.ContainerScriptHarness); !isContainerScript {
+		if err := harness.StageCaptureAuthAssets(agentHome, hcDir.Path, hcDir.Config.Auth); err != nil {
+			fmt.Fprintf(os.Stderr, "Warning: capture-auth asset staging failed: %v\n", err)
+		}
 	}
 
 	// Reload config to get harness updates (e.g. Env vars injected by harness)

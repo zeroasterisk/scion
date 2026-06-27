@@ -49,6 +49,9 @@ type Store interface {
 	// RuntimeBroker operations
 	RuntimeBrokerStore
 
+	// BrokerDispatch operations (multi-node command dispatch)
+	BrokerDispatchStore
+
 	// Template operations
 	TemplateStore
 
@@ -108,6 +111,15 @@ type Store interface {
 
 	// Invite Code operations (User Invitation System)
 	InviteCodeStore
+
+	// LifecycleHook operations (Configurable Agent Lifecycle Hooks)
+	LifecycleHookStore
+
+	// Skill operations (Skill Bank)
+	SkillStore
+
+	// Skill Registry operations (Hub-to-Hub Federation)
+	SkillRegistryStore
 }
 
 // AgentStore defines agent-related persistence operations.
@@ -302,6 +314,36 @@ type RuntimeBrokerStore interface {
 
 	// UpdateRuntimeBrokerHeartbeat updates the last heartbeat and status.
 	UpdateRuntimeBrokerHeartbeat(ctx context.Context, id string, status string) error
+
+	// ClaimRuntimeBrokerConnection records this hub instance as the owner of the
+	// broker's live control-channel socket. The newest connection wins
+	// (unconditional claim): it sets connected_hub_id/connected_session_id/
+	// connected_at and, in the same write, bumps status to online and refreshes
+	// last_heartbeat.
+	ClaimRuntimeBrokerConnection(ctx context.Context, brokerID, hubInstanceID, sessionID string) error
+
+	// ReleaseRuntimeBrokerConnection clears the broker's affinity ONLY IF it still
+	// names (hubInstanceID, sessionID) — a compare-and-clear. It returns
+	// cleared=true when this caller owned the affinity and it was cleared; it
+	// returns cleared=false (a no-op) when affinity has already moved to another
+	// hub/session, in which case the caller MUST NOT stamp the broker offline.
+	// It does not change status (the caller decides offline based on cleared).
+	ReleaseRuntimeBrokerConnection(ctx context.Context, brokerID, hubInstanceID, sessionID string) (cleared bool, err error)
+
+	// ReleaseAndMarkBrokerOffline atomically clears broker affinity AND stamps
+	// status=offline, ONLY IF affinity still names (hubInstanceID, sessionID).
+	// This prevents a stale disconnect callback from clobbering a concurrent
+	// reconnect's online status — the session check and the offline stamp happen
+	// in the same CAS write with no TOCTOU window.
+	// Returns cleared=true when affinity matched and the broker was stamped offline.
+	// Returns cleared=false (no-op) when affinity has already moved.
+	ReleaseAndMarkBrokerOffline(ctx context.Context, brokerID, hubInstanceID, sessionID string) (cleared bool, err error)
+
+	// ReapStaleBrokerAffinity clears connected_hub_id/connected_session_id/
+	// connected_at for brokers whose last_heartbeat is older than staleBefore
+	// and whose connected_hub_id is not NULL (i.e. they still claim affinity).
+	// Returns the number of rows cleared. Does not change broker status.
+	ReapStaleBrokerAffinity(ctx context.Context, staleBefore time.Time) (cleared int, err error)
 }
 
 // RuntimeBrokerFilter defines criteria for filtering runtime brokers.
@@ -310,6 +352,52 @@ type RuntimeBrokerFilter struct {
 	ProjectID   string
 	Name        string // Exact match on broker name (case-insensitive)
 	AutoProvide *bool  // Filter by auto-provide flag (nil = no filter)
+}
+
+// BrokerDispatchStore defines persistence for the durable broker-dispatch intent
+// table and the message dispatch-state CAS helpers (multi-node command dispatch).
+type BrokerDispatchStore interface {
+	// InsertBrokerDispatch persists a new dispatch intent (state defaults pending).
+	InsertBrokerDispatch(ctx context.Context, d *BrokerDispatch) error
+
+	// ClaimBrokerDispatch CAS-transitions a dispatch pending->in_progress for the
+	// given hub instance. Returns claimed=false if it was not pending (so exactly
+	// one node executes a given intent).
+	ClaimBrokerDispatch(ctx context.Context, id, hubInstanceID string) (claimed bool, err error)
+
+	// CompleteBrokerDispatch marks a dispatch done with an optional result JSON.
+	CompleteBrokerDispatch(ctx context.Context, id, result string) error
+
+	// FailBrokerDispatch marks a dispatch failed, records the error, bumps attempts.
+	FailBrokerDispatch(ctx context.Context, id, errMsg string) error
+
+	// GetBrokerDispatch returns a single dispatch row by ID (used by the
+	// originator to read the result after the owner completes it).
+	GetBrokerDispatch(ctx context.Context, id string) (*BrokerDispatch, error)
+
+	// ListPendingDispatch returns pending intents for a broker (drain query).
+	ListPendingDispatch(ctx context.Context, brokerID string) ([]BrokerDispatch, error)
+
+	// MarkMessageDispatched CAS-flips a message pending->dispatched (dedupes drains).
+	MarkMessageDispatched(ctx context.Context, id string) (dispatched bool, err error)
+
+	// MarkMessageFailed sets a message's dispatch_state to "failed" with a reason.
+	MarkMessageFailed(ctx context.Context, id string, reason string) error
+
+	// ListPendingMessages returns pending messages whose target agent is on the broker.
+	ListPendingMessages(ctx context.Context, brokerID string) ([]Message, error)
+
+	// ReapStuckDispatch re-drives or fails in_progress dispatches that have gone
+	// stale (updated_at < stuckBefore). Dispatches with attempts < maxAttempts
+	// are reset to pending (re-driven); those at or above the limit are failed.
+	// Returns counts of re-driven and failed rows.
+	ReapStuckDispatch(ctx context.Context, stuckBefore time.Time, maxAttempts int) (requeued, failed int, err error)
+
+	// CountStuckPendingMessages returns the number of messages still in
+	// dispatch_state='pending' whose created timestamp is before the given
+	// cutoff. Used by the stuck-message sweep (B5-2) to surface messages that
+	// have not been dispatched within the expected window.
+	CountStuckPendingMessages(ctx context.Context, before time.Time) (int, error)
 }
 
 // TemplateStore defines template persistence operations.
@@ -1100,4 +1188,107 @@ type ProjectSyncStateStore interface {
 	// DeleteProjectSyncState removes sync state for a project and optional broker.
 	// Returns ErrNotFound if the state doesn't exist.
 	DeleteProjectSyncState(ctx context.Context, projectID, brokerID string) error
+}
+
+// =============================================================================
+// Lifecycle Hooks (Configurable Agent Lifecycle Hooks)
+// =============================================================================
+
+// LifecycleHookStore defines lifecycle-hook persistence operations.
+type LifecycleHookStore interface {
+	// CreateLifecycleHook creates a new lifecycle hook record.
+	// Returns ErrAlreadyExists if a hook with the same ID exists.
+	CreateLifecycleHook(ctx context.Context, hook *LifecycleHook) error
+
+	// GetLifecycleHook retrieves a lifecycle hook by ID.
+	// Returns ErrNotFound if the hook doesn't exist.
+	GetLifecycleHook(ctx context.Context, id string) (*LifecycleHook, error)
+
+	// UpdateLifecycleHook updates an existing lifecycle hook.
+	// Uses optimistic locking via StateVersion.
+	// Returns ErrNotFound if the hook doesn't exist.
+	// Returns ErrVersionConflict if the version doesn't match.
+	UpdateLifecycleHook(ctx context.Context, hook *LifecycleHook) error
+
+	// DeleteLifecycleHook removes a lifecycle hook by ID.
+	// Returns ErrNotFound if the hook doesn't exist.
+	DeleteLifecycleHook(ctx context.Context, id string) error
+
+	// ListLifecycleHooks returns lifecycle hooks matching the filter criteria.
+	ListLifecycleHooks(ctx context.Context, filter LifecycleHookFilter, opts ListOptions) (*ListResult[LifecycleHook], error)
+
+	// CompareAndSetHookPhase atomically records newPhase as the last-processed
+	// phase for an agent's lifecycle-hook evaluation. It returns changed=true
+	// ONLY when the stored phase actually differed from newPhase (or no row
+	// existed yet). This is used for HA transition de-duplication: across
+	// multiple hub instances the single instance whose CAS succeeds "wins" and
+	// fires hooks; all others see changed=false and skip.
+	CompareAndSetHookPhase(ctx context.Context, agentID, newPhase string) (changed bool, err error)
+
+	// DeleteHookPhase removes the stored last-processed phase for an agent.
+	// Called on terminal phases (stopped/error) and agent deletion to prevent
+	// unbounded growth. No error is returned if the row does not exist.
+	DeleteHookPhase(ctx context.Context, agentID string) error
+}
+
+// LifecycleHookFilter defines criteria for filtering lifecycle hooks.
+type LifecycleHookFilter struct {
+	ScopeType string // Filter by scope type (hub, project)
+	ScopeID   string // Filter by scope ID
+	Trigger   string // Filter by trigger (running, suspended, stopped, error)
+	Enabled   *bool  // Filter by enabled status (nil = no filter)
+}
+
+// =============================================================================
+// Skills (Skill Bank)
+// =============================================================================
+
+// SkillStore defines skill-related persistence operations.
+type SkillStore interface {
+	CreateSkill(ctx context.Context, skill *Skill) error
+	GetSkill(ctx context.Context, id string) (*Skill, error)
+	GetSkillBySlug(ctx context.Context, slug, scope, scopeID string) (*Skill, error)
+	UpdateSkill(ctx context.Context, skill *Skill) error
+	DeleteSkill(ctx context.Context, id string) error
+	ListSkills(ctx context.Context, filter SkillFilter, opts ListOptions) (*ListResult[Skill], error)
+
+	CreateSkillVersion(ctx context.Context, version *SkillVersion) error
+	GetSkillVersion(ctx context.Context, id string) (*SkillVersion, error)
+	GetSkillVersionByNumber(ctx context.Context, skillID, version string) (*SkillVersion, error)
+	ListSkillVersions(ctx context.Context, skillID string, opts ListOptions) (*ListResult[SkillVersion], error)
+	UpdateSkillVersion(ctx context.Context, version *SkillVersion) error
+	DeleteSkillVersion(ctx context.Context, id string) error
+
+	ResolveSkillVersion(ctx context.Context, skillID, constraint string) (*SkillVersion, error)
+
+	IncrementSkillVersionDownloadCount(ctx context.Context, versionID string) error
+}
+
+// SkillFilter defines criteria for filtering skills.
+type SkillFilter struct {
+	Name    string
+	Scope   string
+	ScopeID string
+	OwnerID string
+	Status  string
+	Search  string
+	Tags    []string
+}
+
+// =============================================================================
+// Skill Registries (Hub-to-Hub Federation)
+// =============================================================================
+
+// SkillRegistryStore defines skill registry persistence operations.
+type SkillRegistryStore interface {
+	CreateSkillRegistry(ctx context.Context, registry *SkillRegistry) error
+	GetSkillRegistry(ctx context.Context, id string) (*SkillRegistry, error)
+	GetSkillRegistryByName(ctx context.Context, name string) (*SkillRegistry, error)
+	UpdateSkillRegistry(ctx context.Context, registry *SkillRegistry) error
+	DeleteSkillRegistry(ctx context.Context, id string) error
+	ListSkillRegistries(ctx context.Context, opts ListOptions) (*ListResult[SkillRegistry], error)
+	PinSkillHash(ctx context.Context, registryID string, uri string, hash string) error
+	UnpinSkillHash(ctx context.Context, registryID string, uri string) error
+	GetPinnedHash(ctx context.Context, registryID string, uri string) (string, error)
+	ListPinnedHashes(ctx context.Context, registryID string) (map[string]string, error)
 }

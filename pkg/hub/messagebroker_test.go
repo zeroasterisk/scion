@@ -27,7 +27,6 @@ import (
 	"github.com/GoogleCloudPlatform/scion/pkg/eventbus"
 	"github.com/GoogleCloudPlatform/scion/pkg/messages"
 	"github.com/GoogleCloudPlatform/scion/pkg/store"
-	"github.com/GoogleCloudPlatform/scion/pkg/store/sqlite"
 )
 
 // brokerMockDispatcher records dispatched messages for test assertions.
@@ -49,13 +48,16 @@ func (d *brokerMockDispatcher) DispatchAgentCreate(ctx context.Context, agent *s
 func (d *brokerMockDispatcher) DispatchAgentProvision(ctx context.Context, agent *store.Agent) error {
 	return nil
 }
-func (d *brokerMockDispatcher) DispatchAgentStart(ctx context.Context, agent *store.Agent, task string) error {
+func (d *brokerMockDispatcher) DispatchAgentStart(ctx context.Context, agent *store.Agent, task string, _ bool) error {
 	return nil
 }
 func (d *brokerMockDispatcher) DispatchAgentStop(ctx context.Context, agent *store.Agent) error {
 	return nil
 }
 func (d *brokerMockDispatcher) DispatchAgentRestart(ctx context.Context, agent *store.Agent) error {
+	return nil
+}
+func (d *brokerMockDispatcher) DispatchAgentResetAuth(_ context.Context, _ *store.Agent) error {
 	return nil
 }
 func (d *brokerMockDispatcher) DispatchAgentDelete(ctx context.Context, agent *store.Agent, deleteFiles, removeBranch, softDelete bool, deletedAt time.Time) error {
@@ -98,7 +100,7 @@ func (d *brokerMockDispatcher) getMessages() []brokerDispatchedMsg {
 
 func newBrokerTestStore(t *testing.T) store.Store {
 	t.Helper()
-	s, err := sqlite.New(":memory:")
+	s, err := newTestStore(":memory:")
 	if err != nil {
 		t.Fatalf("failed to create test store: %v", err)
 	}
@@ -115,7 +117,7 @@ func setupBrokerTestProject(t *testing.T, s store.Store) string {
 
 	// Create a runtime broker for agent FK constraints
 	rb := &store.RuntimeBroker{
-		ID:       "broker-1",
+		ID:       tid("broker-1"),
 		Name:     "test-broker",
 		Slug:     "test-broker",
 		Endpoint: "http://localhost:9800",
@@ -146,7 +148,7 @@ func setupBrokerTestAgent(t *testing.T, s store.Store, projectID, slug, phase st
 		Slug:            slug,
 		ProjectID:       projectID,
 		Phase:           phase,
-		RuntimeBrokerID: "broker-1",
+		RuntimeBrokerID: tid("broker-1"),
 		Visibility:      store.VisibilityPrivate,
 	}
 	if err := s.CreateAgent(context.Background(), agent); err != nil {
@@ -164,7 +166,7 @@ func TestMessageBrokerProxy_DirectMessage(t *testing.T) {
 	defer events.Close()
 
 	b := eventbus.NewInProcessEventBus(slog.Default())
-	defer b.Close()
+	defer func() { _ = b.Close() }()
 
 	dispatcher := &brokerMockDispatcher{}
 
@@ -193,6 +195,190 @@ func TestMessageBrokerProxy_DirectMessage(t *testing.T) {
 	}
 }
 
+func TestMessageBrokerProxy_InterruptPrefix(t *testing.T) {
+	s := newBrokerTestStore(t)
+	projectID := setupBrokerTestProject(t, s)
+	setupBrokerTestAgent(t, s, projectID, "test-agent", "running")
+
+	events := NewChannelEventPublisher()
+	defer events.Close()
+
+	b := eventbus.NewInProcessEventBus(slog.Default())
+	t.Cleanup(func() { _ = b.Close() })
+
+	dispatcher := &brokerMockDispatcher{}
+
+	proxy := NewMessageBrokerProxy(b, s, events, func() AgentDispatcher { return dispatcher }, slog.Default())
+	proxy.Start()
+	defer proxy.Stop()
+
+	proxy.subscribeAgent(projectID, "test-agent")
+
+	msg := messages.NewInstruction("user:alice", "agent:test-agent", "!restart now")
+	if err := proxy.PublishMessage(context.Background(), projectID, msg); err != nil {
+		t.Fatal(err)
+	}
+
+	time.Sleep(100 * time.Millisecond)
+
+	dispatched := dispatcher.getMessages()
+	if len(dispatched) != 1 {
+		t.Fatalf("expected 1 dispatched message, got %d", len(dispatched))
+	}
+	if dispatched[0].msg != "restart now" {
+		t.Errorf("expected message 'restart now' (! stripped), got %q", dispatched[0].msg)
+	}
+	if !dispatched[0].interrupt {
+		t.Error("expected interrupt=true for !-prefixed message")
+	}
+	if !dispatched[0].structured.Urgent {
+		t.Error("expected structured message Urgent=true for !-prefixed message")
+	}
+}
+
+func TestMessageBrokerProxy_InterruptPrefixNotStrippedWithoutBang(t *testing.T) {
+	s := newBrokerTestStore(t)
+	projectID := setupBrokerTestProject(t, s)
+	setupBrokerTestAgent(t, s, projectID, "test-agent", "running")
+
+	events := NewChannelEventPublisher()
+	defer events.Close()
+
+	b := eventbus.NewInProcessEventBus(slog.Default())
+	t.Cleanup(func() { _ = b.Close() })
+
+	dispatcher := &brokerMockDispatcher{}
+
+	proxy := NewMessageBrokerProxy(b, s, events, func() AgentDispatcher { return dispatcher }, slog.Default())
+	proxy.Start()
+	defer proxy.Stop()
+
+	proxy.subscribeAgent(projectID, "test-agent")
+
+	msg := messages.NewInstruction("user:alice", "agent:test-agent", "hello agent")
+	if err := proxy.PublishMessage(context.Background(), projectID, msg); err != nil {
+		t.Fatal(err)
+	}
+
+	time.Sleep(100 * time.Millisecond)
+
+	dispatched := dispatcher.getMessages()
+	if len(dispatched) != 1 {
+		t.Fatalf("expected 1 dispatched message, got %d", len(dispatched))
+	}
+	if dispatched[0].msg != "hello agent" {
+		t.Errorf("expected message 'hello agent' unchanged, got %q", dispatched[0].msg)
+	}
+	if dispatched[0].interrupt {
+		t.Error("expected interrupt=false for non-!-prefixed message")
+	}
+}
+
+func TestMessageBrokerProxy_InterruptPrefixEdgeCases(t *testing.T) {
+	tests := []struct {
+		name          string
+		input         string
+		wantMsg       string
+		wantInterrupt bool
+		wantUrgent    bool
+	}{
+		{"bare bang", "!", "interrupt", true, true},
+		{"bang with trailing spaces", "!   ", "interrupt", true, true},
+		{"leading whitespace before bang", "  !restart", "restart", true, true},
+		{"whitespace between bang and content", "!  restart", "restart", true, true},
+		{"leading and inner whitespace", "  !  restart now  ", "restart now", true, true},
+		{"normal message no prefix", "hello", "hello", false, false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			s := newBrokerTestStore(t)
+			projectID := setupBrokerTestProject(t, s)
+			setupBrokerTestAgent(t, s, projectID, "test-agent", "running")
+
+			events := NewChannelEventPublisher()
+			defer events.Close()
+
+			bus := eventbus.NewInProcessEventBus(slog.Default())
+			t.Cleanup(func() { _ = bus.Close() })
+
+			dispatcher := &brokerMockDispatcher{}
+
+			proxy := NewMessageBrokerProxy(bus, s, events, func() AgentDispatcher { return dispatcher }, slog.Default())
+			proxy.Start()
+			defer proxy.Stop()
+
+			proxy.subscribeAgent(projectID, "test-agent")
+
+			msg := messages.NewInstruction("user:alice", "agent:test-agent", tt.input)
+			if err := proxy.PublishMessage(context.Background(), projectID, msg); err != nil {
+				t.Fatal(err)
+			}
+
+			time.Sleep(100 * time.Millisecond)
+
+			dispatched := dispatcher.getMessages()
+			if len(dispatched) != 1 {
+				t.Fatalf("expected 1 dispatched message, got %d", len(dispatched))
+			}
+			if dispatched[0].msg != tt.wantMsg {
+				t.Errorf("msg = %q, want %q", dispatched[0].msg, tt.wantMsg)
+			}
+			if dispatched[0].interrupt != tt.wantInterrupt {
+				t.Errorf("interrupt = %v, want %v", dispatched[0].interrupt, tt.wantInterrupt)
+			}
+			if dispatched[0].structured.Urgent != tt.wantUrgent {
+				t.Errorf("Urgent = %v, want %v", dispatched[0].structured.Urgent, tt.wantUrgent)
+			}
+		})
+	}
+}
+
+func TestMessageBrokerProxy_InterruptPrefixPersistence(t *testing.T) {
+	s := newBrokerTestStore(t)
+	projectID := setupBrokerTestProject(t, s)
+	agent := setupBrokerTestAgent(t, s, projectID, "persist-agent", "running")
+
+	events := NewChannelEventPublisher()
+	defer events.Close()
+
+	b := eventbus.NewInProcessEventBus(slog.Default())
+	t.Cleanup(func() { _ = b.Close() })
+
+	dispatcher := &brokerMockDispatcher{}
+
+	proxy := NewMessageBrokerProxy(b, s, events, func() AgentDispatcher { return dispatcher }, slog.Default())
+	proxy.Start()
+	defer proxy.Stop()
+
+	proxy.subscribeAgent(projectID, "persist-agent")
+
+	msg := messages.NewInstruction("user:alice", "agent:persist-agent", "!urgent task")
+	msg.SenderID = "user-alice-id"
+	msg.RecipientID = agent.ID
+	if err := proxy.PublishMessage(context.Background(), projectID, msg); err != nil {
+		t.Fatal(err)
+	}
+
+	time.Sleep(100 * time.Millisecond)
+
+	// Verify the persisted message has the stripped content and urgent flag
+	ctx := context.Background()
+	result, err := s.ListMessages(ctx, store.MessageFilter{AgentID: agent.ID}, store.ListOptions{})
+	if err != nil {
+		t.Fatalf("failed to list messages: %v", err)
+	}
+	if len(result.Items) != 1 {
+		t.Fatalf("expected 1 persisted message, got %d", len(result.Items))
+	}
+	if result.Items[0].Msg != "urgent task" {
+		t.Errorf("expected persisted msg 'urgent task', got %q", result.Items[0].Msg)
+	}
+	if !result.Items[0].Urgent {
+		t.Error("expected persisted message Urgent=true")
+	}
+}
+
 func TestMessageBrokerProxy_ProjectBroadcast(t *testing.T) {
 	s := newBrokerTestStore(t)
 	projectID := setupBrokerTestProject(t, s)
@@ -203,7 +389,7 @@ func TestMessageBrokerProxy_ProjectBroadcast(t *testing.T) {
 	defer events.Close()
 
 	b := eventbus.NewInProcessEventBus(slog.Default())
-	defer b.Close()
+	defer func() { _ = b.Close() }()
 
 	dispatcher := &brokerMockDispatcher{}
 
@@ -239,13 +425,13 @@ func TestMessageBrokerProxy_BroadcastSkipsSender(t *testing.T) {
 	s := newBrokerTestStore(t)
 	projectID := setupBrokerTestProject(t, s)
 	setupBrokerTestAgent(t, s, projectID, "sender-agent", "running")
-	setupBrokerTestAgent(t, s, projectID, "other-agent", "running")
+	setupBrokerTestAgent(t, s, projectID, tid("other-agent"), "running")
 
 	events := NewChannelEventPublisher()
 	defer events.Close()
 
 	b := eventbus.NewInProcessEventBus(slog.Default())
-	defer b.Close()
+	defer func() { _ = b.Close() }()
 
 	dispatcher := &brokerMockDispatcher{}
 
@@ -257,7 +443,7 @@ func TestMessageBrokerProxy_BroadcastSkipsSender(t *testing.T) {
 
 	msg := messages.NewInstruction("agent:sender-agent", "project:test-project", "any updates?")
 	msg.Broadcasted = true
-	proxy.PublishBroadcast(context.Background(), projectID, msg)
+	_ = proxy.PublishBroadcast(context.Background(), projectID, msg)
 
 	time.Sleep(100 * time.Millisecond)
 
@@ -265,7 +451,7 @@ func TestMessageBrokerProxy_BroadcastSkipsSender(t *testing.T) {
 	if len(dispatched) != 1 {
 		t.Fatalf("expected 1 message (sender excluded), got %d", len(dispatched))
 	}
-	if dispatched[0].agentSlug != "other-agent" {
+	if dispatched[0].agentSlug != tid("other-agent") {
 		t.Errorf("expected message delivered to 'other-agent', got %q", dispatched[0].agentSlug)
 	}
 }
@@ -280,7 +466,7 @@ func TestMessageBrokerProxy_EnsureProjectSubscriptions(t *testing.T) {
 	defer events.Close()
 
 	b := eventbus.NewInProcessEventBus(slog.Default())
-	defer b.Close()
+	defer func() { _ = b.Close() }()
 
 	dispatcher := &brokerMockDispatcher{}
 
@@ -293,7 +479,7 @@ func TestMessageBrokerProxy_EnsureProjectSubscriptions(t *testing.T) {
 	}
 
 	msg := messages.NewInstruction("user:alice", "agent:running-agent", "hello")
-	proxy.PublishMessage(context.Background(), projectID, msg)
+	_ = proxy.PublishMessage(context.Background(), projectID, msg)
 
 	time.Sleep(100 * time.Millisecond)
 
@@ -312,7 +498,7 @@ func TestMessageBrokerProxy_DeliverToAgentPersistence(t *testing.T) {
 	defer events.Close()
 
 	b := eventbus.NewInProcessEventBus(slog.Default())
-	defer b.Close()
+	defer func() { _ = b.Close() }()
 
 	dispatcher := &brokerMockDispatcher{}
 
@@ -363,7 +549,7 @@ func TestMessageBrokerProxy_UserMessageDelivery(t *testing.T) {
 	defer events.Close()
 
 	b := eventbus.NewInProcessEventBus(slog.Default())
-	defer b.Close()
+	defer func() { _ = b.Close() }()
 
 	dispatcher := &brokerMockDispatcher{}
 
@@ -425,7 +611,7 @@ func TestMessageBrokerProxy_EnsureProjectSubscriptionsIncludesUserMessages(t *te
 	defer events.Close()
 
 	b := eventbus.NewInProcessEventBus(slog.Default())
-	defer b.Close()
+	defer func() { _ = b.Close() }()
 
 	dispatcher := &brokerMockDispatcher{}
 
@@ -468,7 +654,7 @@ func TestMessageBrokerProxy_PluginSubscription(t *testing.T) {
 	defer events.Close()
 
 	b := eventbus.NewInProcessEventBus(slog.Default())
-	defer b.Close()
+	defer func() { _ = b.Close() }()
 
 	dispatcher := &brokerMockDispatcher{}
 
@@ -499,7 +685,7 @@ func TestMessageBrokerProxy_PluginSubscriptionDedup(t *testing.T) {
 	defer events.Close()
 
 	b := eventbus.NewInProcessEventBus(slog.Default())
-	defer b.Close()
+	defer func() { _ = b.Close() }()
 
 	dispatcher := &brokerMockDispatcher{}
 
@@ -533,7 +719,7 @@ func TestMessageBrokerProxy_PluginSubscriptionCancel(t *testing.T) {
 	defer events.Close()
 
 	b := eventbus.NewInProcessEventBus(slog.Default())
-	defer b.Close()
+	defer func() { _ = b.Close() }()
 
 	dispatcher := &brokerMockDispatcher{}
 
@@ -571,7 +757,7 @@ func TestMessageBrokerProxy_PluginSubscriptionCleanupOnStop(t *testing.T) {
 	defer events.Close()
 
 	b := eventbus.NewInProcessEventBus(slog.Default())
-	defer b.Close()
+	defer func() { _ = b.Close() }()
 
 	dispatcher := &brokerMockDispatcher{}
 
@@ -604,7 +790,7 @@ func TestMessageBrokerProxy_StartBootstrapsExistingProjects(t *testing.T) {
 	defer events.Close()
 
 	b := eventbus.NewInProcessEventBus(slog.Default())
-	defer b.Close()
+	defer func() { _ = b.Close() }()
 
 	dispatcher := &brokerMockDispatcher{}
 
@@ -661,7 +847,7 @@ func TestMessageBrokerProxy_ProjectSubscriptionDedup(t *testing.T) {
 	defer events.Close()
 
 	b := eventbus.NewInProcessEventBus(slog.Default())
-	defer b.Close()
+	defer func() { _ = b.Close() }()
 
 	dispatcher := &brokerMockDispatcher{}
 
@@ -707,7 +893,7 @@ func TestMessageBrokerProxy_PublishToGroup(t *testing.T) {
 	defer events.Close()
 
 	b := eventbus.NewInProcessEventBus(slog.Default())
-	defer b.Close()
+	defer func() { _ = b.Close() }()
 
 	dispatcher := &brokerMockDispatcher{}
 

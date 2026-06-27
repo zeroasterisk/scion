@@ -15,6 +15,7 @@
 package hub
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -25,9 +26,13 @@ import (
 	"runtime"
 	"strings"
 
+	scionruntime "github.com/GoogleCloudPlatform/scion/pkg/runtime"
 	"github.com/GoogleCloudPlatform/scion/pkg/secret"
+	"github.com/GoogleCloudPlatform/scion/pkg/storage"
 	"github.com/GoogleCloudPlatform/scion/pkg/store"
+	"github.com/GoogleCloudPlatform/scion/pkg/transfer"
 	"github.com/GoogleCloudPlatform/scion/pkg/util/logging"
+	"gopkg.in/yaml.v3"
 )
 
 // MaintenanceExecutor defines the interface for a runnable maintenance operation.
@@ -68,13 +73,13 @@ func (e *SecretMigrationExecutor) Run(ctx context.Context, logger io.Writer, par
 	}
 
 	if len(allSecrets) == 0 {
-		fmt.Fprintln(logger, "No secrets found to migrate.")
+		_, _ = fmt.Fprintln(logger, "No secrets found to migrate.")
 		return nil
 	}
 
-	fmt.Fprintf(logger, "Found %d secret(s) to process.\n", len(allSecrets))
+	_, _ = fmt.Fprintf(logger, "Found %d secret(s) to process.\n", len(allSecrets))
 	if dryRun {
-		fmt.Fprintln(logger, "DRY RUN: No changes will be made.")
+		_, _ = fmt.Fprintln(logger, "DRY RUN: No changes will be made.")
 	}
 
 	migrated := 0
@@ -83,13 +88,13 @@ func (e *SecretMigrationExecutor) Run(ctx context.Context, logger io.Writer, par
 	for _, s := range allSecrets {
 		// Skip secrets that already have a GCP SM reference.
 		if s.SecretRef != "" {
-			fmt.Fprintf(logger, "  SKIP  %s (scope: %s/%s) - already has ref: %s\n", s.Key, s.Scope, s.ScopeID, s.SecretRef)
+			_, _ = fmt.Fprintf(logger, "  SKIP  %s (scope: %s/%s) - already has ref: %s\n", s.Key, s.Scope, s.ScopeID, s.SecretRef)
 			skipped++
 			continue
 		}
 
 		if dryRun {
-			fmt.Fprintf(logger, "  WOULD MIGRATE  %s (scope: %s/%s, type: %s)\n", s.Key, s.Scope, s.ScopeID, s.SecretType)
+			_, _ = fmt.Fprintf(logger, "  WOULD MIGRATE  %s (scope: %s/%s, type: %s)\n", s.Key, s.Scope, s.ScopeID, s.SecretType)
 			migrated++
 			continue
 		}
@@ -97,7 +102,7 @@ func (e *SecretMigrationExecutor) Run(ctx context.Context, logger io.Writer, par
 		// Read value from the database.
 		value, err := e.store.GetSecretValue(ctx, s.Key, s.Scope, s.ScopeID)
 		if err != nil {
-			fmt.Fprintf(logger, "  WARN  %s (scope: %s/%s) - failed to get value: %v\n", s.Key, s.Scope, s.ScopeID, err)
+			_, _ = fmt.Fprintf(logger, "  WARN  %s (scope: %s/%s) - failed to get value: %v\n", s.Key, s.Scope, s.ScopeID, err)
 			skipped++
 			continue
 		}
@@ -119,12 +124,12 @@ func (e *SecretMigrationExecutor) Run(ctx context.Context, logger io.Writer, par
 		}
 
 		if _, _, err := gcpBackend.Set(ctx, input); err != nil {
-			fmt.Fprintf(logger, "  ERROR  %s (scope: %s/%s) - %v\n", s.Key, s.Scope, s.ScopeID, err)
+			_, _ = fmt.Fprintf(logger, "  ERROR  %s (scope: %s/%s) - %v\n", s.Key, s.Scope, s.ScopeID, err)
 			skipped++
 			continue
 		}
 
-		fmt.Fprintf(logger, "  MIGRATED  %s (scope: %s/%s, type: %s)\n", s.Key, s.Scope, s.ScopeID, s.SecretType)
+		_, _ = fmt.Fprintf(logger, "  MIGRATED  %s (scope: %s/%s, type: %s)\n", s.Key, s.Scope, s.ScopeID, s.SecretType)
 		migrated++
 	}
 
@@ -132,7 +137,7 @@ func (e *SecretMigrationExecutor) Run(ctx context.Context, logger io.Writer, par
 	if dryRun {
 		status = "dry run complete"
 	}
-	fmt.Fprintf(logger, "\nMigration %s: %d migrated, %d skipped\n", status, migrated, skipped)
+	_, _ = fmt.Fprintf(logger, "\nMigration %s: %d migrated, %d skipped\n", status, migrated, skipped)
 
 	return nil
 }
@@ -172,7 +177,7 @@ func (e *PullImagesExecutor) Run(ctx context.Context, logger io.Writer, params m
 
 	runtimeBin := e.runtimeBin
 	if runtimeBin == "" {
-		runtimeBin = detectContainerRuntime()
+		runtimeBin = scionruntime.DetectContainerRuntime()
 	}
 	if runtimeBin == "" {
 		return fmt.Errorf("no container runtime found (tried docker, podman)")
@@ -180,54 +185,44 @@ func (e *PullImagesExecutor) Run(ctx context.Context, logger io.Writer, params m
 
 	harnesses := e.harnesses
 	if len(harnesses) == 0 {
-		harnesses = []string{"claude", "gemini", "opencode", "codex"}
+		harnesses = []string{"claude", "gemini"}
 	}
 
 	log.Debug("Starting pull-images",
 		"runtime", runtimeBin, "registry", registry, "tag", tag,
 		"harnesses", fmt.Sprint(harnesses))
 
-	fmt.Fprintf(logger, "Using runtime: %s\n", runtimeBin)
-	fmt.Fprintf(logger, "Registry: %s, Tag: %s\n", registry, tag)
-	fmt.Fprintf(logger, "Pulling %d image(s)...\n\n", len(harnesses))
+	_, _ = fmt.Fprintf(logger, "Using runtime: %s\n", runtimeBin)
+	_, _ = fmt.Fprintf(logger, "Registry: %s, Tag: %s\n", registry, tag)
+	_, _ = fmt.Fprintf(logger, "Pulling %d image(s)...\n\n", len(harnesses))
 
 	pulled := 0
 	var lastErr error
 	for _, h := range harnesses {
 		image := fmt.Sprintf("%s/scion-%s:%s", registry, h, tag)
-		fmt.Fprintf(logger, "Pulling %s ...\n", image)
+		_, _ = fmt.Fprintf(logger, "Pulling %s ...\n", image)
 		log.Debug("Pulling image", "image", image)
 
 		cmd := exec.CommandContext(ctx, runtimeBin, "image", "pull", image)
 		cmd.Stdout = logger
 		cmd.Stderr = logger
 		if err := cmd.Run(); err != nil {
-			fmt.Fprintf(logger, "  ERROR: %v\n\n", err)
+			_, _ = fmt.Fprintf(logger, "  ERROR: %v\n\n", err)
 			log.Error("Image pull failed", "image", image, "error", err)
 			lastErr = err
 			continue
 		}
-		fmt.Fprintf(logger, "  OK\n\n")
+		_, _ = fmt.Fprintf(logger, "  OK\n\n")
 		log.Debug("Image pulled successfully", "image", image)
 		pulled++
 	}
 
-	fmt.Fprintf(logger, "Pull complete: %d/%d succeeded\n", pulled, len(harnesses))
+	_, _ = fmt.Fprintf(logger, "Pull complete: %d/%d succeeded\n", pulled, len(harnesses))
 	if lastErr != nil && pulled == 0 {
 		return fmt.Errorf("all image pulls failed; last error: %w", lastErr)
 	}
 	log.Info("Pull images complete", "pulled", pulled, "total", len(harnesses))
 	return nil
-}
-
-// detectContainerRuntime finds an available container CLI on the system.
-func detectContainerRuntime() string {
-	for _, bin := range []string{"docker", "podman"} {
-		if p, err := exec.LookPath(bin); err == nil && p != "" {
-			return bin
-		}
-	}
-	return ""
 }
 
 // RebuildServerExecutor rebuilds the server binary from git and restarts via systemd.
@@ -300,7 +295,7 @@ func (e *RebuildServerExecutor) Run(ctx context.Context, logger io.Writer, param
 	)
 
 	for i, step := range steps {
-		fmt.Fprintf(logger, "==> %s\n", step.name)
+		_, _ = fmt.Fprintf(logger, "==> %s\n", step.name)
 		log.Debug("Executing step",
 			"step", i+1, "name", step.name,
 			"cmd", step.cmd, "args", fmt.Sprint(step.args), "dir", step.dir)
@@ -317,7 +312,7 @@ func (e *RebuildServerExecutor) Run(ctx context.Context, logger io.Writer, param
 			return fmt.Errorf("%s failed: %w", step.name, err)
 		}
 		log.Debug("Step completed", "step", i+1, "name", step.name)
-		fmt.Fprintln(logger)
+		_, _ = fmt.Fprintln(logger)
 	}
 
 	// Fire-and-forget: start the restart but don't wait for it to finish.
@@ -325,7 +320,7 @@ func (e *RebuildServerExecutor) Run(ctx context.Context, logger io.Writer, param
 	// would never return — it reports "signal: terminated". Using cmd.Start()
 	// lets us return success so the calling goroutine can persist the
 	// completed run status to the DB before the process is killed.
-	fmt.Fprintf(logger, "==> Restarting service\n")
+	_, _ = fmt.Fprintf(logger, "==> Restarting service\n")
 	log.Debug("Initiating service restart (fire-and-forget)",
 		"cmd", "sudo", "args", fmt.Sprintf("[systemctl restart %s]", serviceName))
 	restartCmd := exec.Command("sudo", "systemctl", "restart", serviceName)
@@ -337,7 +332,7 @@ func (e *RebuildServerExecutor) Run(ctx context.Context, logger io.Writer, param
 	}
 
 	log.Info("Server rebuild complete, restart initiated")
-	fmt.Fprintln(logger, "\nServer rebuild complete, restart initiated.")
+	_, _ = fmt.Fprintln(logger, "\nServer rebuild complete, restart initiated.")
 	return nil
 }
 
@@ -379,7 +374,7 @@ func (e *RebuildWebExecutor) Run(ctx context.Context, logger io.Writer, params m
 	steps = append(steps, step{"Building web assets", "make", []string{"web"}})
 
 	for i, step := range steps {
-		fmt.Fprintf(logger, "==> %s\n", step.name)
+		_, _ = fmt.Fprintf(logger, "==> %s\n", step.name)
 		log.Debug("Executing step",
 			"step", i+1, "name", step.name,
 			"cmd", step.cmd, "args", fmt.Sprint(step.args))
@@ -393,11 +388,11 @@ func (e *RebuildWebExecutor) Run(ctx context.Context, logger io.Writer, params m
 			return fmt.Errorf("%s failed: %w", step.name, err)
 		}
 		log.Debug("Step completed", "step", i+1, "name", step.name)
-		fmt.Fprintln(logger)
+		_, _ = fmt.Fprintln(logger)
 	}
 
 	log.Info("Web frontend rebuild complete")
-	fmt.Fprintln(logger, "Web frontend rebuild complete. Changes take effect on the next page load.")
+	_, _ = fmt.Fprintln(logger, "Web frontend rebuild complete. Changes take effect on the next page load.")
 	return nil
 }
 
@@ -415,14 +410,14 @@ func (e *RebuildContainerBinariesExecutor) Run(ctx context.Context, logger io.Wr
 	}
 
 	devBinDir := os.Getenv("SCION_DEV_BINARIES")
-	fmt.Fprintf(logger, "SCION_DEV_BINARIES=%s\n", devBinDir)
+	_, _ = fmt.Fprintf(logger, "SCION_DEV_BINARIES=%s\n", devBinDir)
 	if devBinDir == "" {
-		fmt.Fprintln(logger, "WARNING: SCION_DEV_BINARIES is not set; built binaries will not be mounted into containers until it is configured.")
+		_, _ = fmt.Fprintln(logger, "WARNING: SCION_DEV_BINARIES is not set; built binaries will not be mounted into containers until it is configured.")
 	}
 
 	log.Debug("Starting rebuild-container-binaries", "repo_path", e.repoPath)
 
-	fmt.Fprintf(logger, "==> Building container binaries\n")
+	_, _ = fmt.Fprintf(logger, "==> Building container binaries\n")
 	cmd := exec.CommandContext(ctx, "make", "container-binaries")
 	cmd.Dir = e.repoPath
 	cmd.Stdout = logger
@@ -433,7 +428,242 @@ func (e *RebuildContainerBinariesExecutor) Run(ctx context.Context, logger io.Wr
 	}
 
 	log.Info("Container binaries rebuild complete")
-	fmt.Fprintln(logger, "\nContainer binaries rebuild complete.")
+	_, _ = fmt.Fprintln(logger, "\nContainer binaries rebuild complete.")
+	return nil
+}
+
+// BuildHarnessConfigImageExecutor builds a container image from a harness-config's Dockerfile.
+type BuildHarnessConfigImageExecutor struct {
+	store      store.Store
+	storage    storage.Storage
+	runtimeBin string
+	registry   string
+	tag        string
+}
+
+func (e *BuildHarnessConfigImageExecutor) Run(ctx context.Context, logger io.Writer, params map[string]string) error {
+	log := logging.Subsystem("hub.maintenance.build-harness-config-image")
+
+	harnessConfigID := params["harness_config_id"]
+	if harnessConfigID == "" {
+		return fmt.Errorf("missing required parameter: harness_config_id")
+	}
+
+	tag := e.tag
+	if tag == "" {
+		tag = "latest"
+	}
+	if v := params["tag"]; v != "" {
+		tag = v
+	}
+
+	registry := e.registry
+	if v := params["registry"]; v != "" {
+		registry = v
+	}
+	registry = strings.TrimSuffix(registry, "/")
+
+	hc, err := e.store.GetHarnessConfig(ctx, harnessConfigID)
+	if err != nil {
+		return fmt.Errorf("failed to load harness-config %q: %w", harnessConfigID, err)
+	}
+
+	hasDockerfile := false
+	for _, f := range hc.Files {
+		if f.Path == "Dockerfile" {
+			hasDockerfile = true
+			break
+		}
+	}
+	if !hasDockerfile {
+		return fmt.Errorf("harness-config %q does not contain a Dockerfile", hc.Name)
+	}
+
+	if e.storage == nil {
+		return fmt.Errorf("storage not configured")
+	}
+
+	tmpDir, err := os.MkdirTemp("", "scion-build-*")
+	if err != nil {
+		return fmt.Errorf("failed to create temp directory: %w", err)
+	}
+	defer func() { _ = os.RemoveAll(tmpDir) }()
+
+	_, _ = fmt.Fprintf(logger, "Materializing %d file(s) from harness-config %q...\n", len(hc.Files), hc.Name)
+	for _, f := range hc.Files {
+		objectPath := hc.StoragePath + "/" + f.Path
+		reader, _, err := e.storage.Download(ctx, objectPath)
+		if err != nil {
+			return fmt.Errorf("failed to download %q from storage: %w", f.Path, err)
+		}
+
+		destPath := filepath.Join(tmpDir, f.Path)
+		if !strings.HasPrefix(destPath, tmpDir+string(os.PathSeparator)) {
+			_ = reader.Close()
+			return fmt.Errorf("invalid file path %q: escapes build directory", f.Path)
+		}
+		if dir := filepath.Dir(destPath); dir != tmpDir {
+			if err := os.MkdirAll(dir, 0o755); err != nil {
+				_ = reader.Close()
+				return fmt.Errorf("failed to create directory for %q: %w", f.Path, err)
+			}
+		}
+
+		outFile, err := os.Create(destPath)
+		if err != nil {
+			_ = reader.Close()
+			return fmt.Errorf("failed to create file %q: %w", f.Path, err)
+		}
+		_, err = io.Copy(outFile, reader)
+		_ = reader.Close()
+		_ = outFile.Close()
+		if err != nil {
+			return fmt.Errorf("failed to write file %q: %w", f.Path, err)
+		}
+
+		if f.Mode != "" {
+			mode := os.FileMode(0o644)
+			if _, err := fmt.Sscanf(f.Mode, "%o", &mode); err == nil {
+				_ = os.Chmod(destPath, mode)
+			}
+		}
+	}
+
+	baseImage := "scion-base:" + tag
+	if registry != "" {
+		baseImage = registry + "/scion-base:" + tag
+	}
+	_, _ = fmt.Fprintf(logger, "Base image: %s\n", baseImage)
+
+	runtimeBin := e.runtimeBin
+	if runtimeBin == "" {
+		runtimeBin = scionruntime.DetectContainerRuntime()
+	}
+	if runtimeBin == "" {
+		return fmt.Errorf("no container runtime found (tried docker, podman)")
+	}
+
+	imageName := hc.Slug
+	if imageName == "" {
+		imageName = hc.Name
+	}
+	outputImage := imageName + ":" + tag
+	_, _ = fmt.Fprintf(logger, "Building %s from harness-config %q...\n", outputImage, hc.Name)
+	log.Debug("Starting container build",
+		"image", outputImage, "base_image", baseImage,
+		"runtime", runtimeBin, "harness_config", hc.Name)
+
+	cmd := exec.CommandContext(ctx, runtimeBin, "build",
+		"--build-arg", "BASE_IMAGE="+baseImage,
+		"-t", outputImage,
+		tmpDir)
+	cmd.Stdout = logger
+	cmd.Stderr = logger
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("build failed: %w", err)
+	}
+
+	if params["push"] == "true" && registry != "" {
+		pushImage := registry + "/" + outputImage
+		_, _ = fmt.Fprintf(logger, "Tagging %s as %s...\n", outputImage, pushImage)
+		tagCmd := exec.CommandContext(ctx, runtimeBin, "tag", outputImage, pushImage)
+		tagCmd.Stdout = logger
+		tagCmd.Stderr = logger
+		if err := tagCmd.Run(); err != nil {
+			return fmt.Errorf("tag failed: %w", err)
+		}
+
+		_, _ = fmt.Fprintf(logger, "Pushing %s...\n", pushImage)
+		pushCmd := exec.CommandContext(ctx, runtimeBin, "push", pushImage)
+		pushCmd.Stdout = logger
+		pushCmd.Stderr = logger
+		if err := pushCmd.Run(); err != nil {
+			return fmt.Errorf("push failed: %w", err)
+		}
+		outputImage = pushImage
+	}
+
+	// Update the harness config's image in storage and the DB so agents
+	// pick up the newly-built image instead of the stale upstream reference.
+	if err := e.syncBuiltImage(ctx, logger, hc, tmpDir, outputImage); err != nil {
+		log.Error("Failed to sync built image back to store", "error", err)
+		_, _ = fmt.Fprintf(logger, "Warning: build succeeded but failed to update harness-config image: %v\n", err)
+	}
+
+	_, _ = fmt.Fprintf(logger, "\nBuild complete: %s\n", outputImage)
+	log.Info("Build complete", "image", outputImage, "harness_config", hc.Name)
+	return nil
+}
+
+// syncBuiltImage updates the harness config's config.yaml in storage and the
+// DB record to reference the newly-built image.
+func (e *BuildHarnessConfigImageExecutor) syncBuiltImage(ctx context.Context, logger io.Writer, hc *store.HarnessConfig, tmpDir, outputImage string) error {
+	configPath := filepath.Join(tmpDir, "config.yaml")
+	configData, err := os.ReadFile(configPath)
+	if err != nil {
+		return fmt.Errorf("failed to read config.yaml: %w", err)
+	}
+
+	var doc yaml.Node
+	if err := yaml.Unmarshal(configData, &doc); err != nil {
+		return fmt.Errorf("failed to parse config.yaml: %w", err)
+	}
+	if len(doc.Content) == 0 || doc.Content[0].Kind != yaml.MappingNode {
+		return fmt.Errorf("config.yaml root is not a YAML mapping")
+	}
+	{
+		mapping := doc.Content[0]
+		found := false
+		for i := 0; i < len(mapping.Content)-1; i += 2 {
+			if mapping.Content[i].Value == "image" {
+				mapping.Content[i+1].Value = outputImage
+				found = true
+				break
+			}
+		}
+		if !found {
+			mapping.Content = append(mapping.Content,
+				&yaml.Node{Kind: yaml.ScalarNode, Value: "image"},
+				&yaml.Node{Kind: yaml.ScalarNode, Value: outputImage},
+			)
+		}
+	}
+
+	updatedData, err := yaml.Marshal(&doc)
+	if err != nil {
+		return fmt.Errorf("failed to marshal updated config.yaml: %w", err)
+	}
+
+	// Upload updated config.yaml to storage.
+	if e.storage != nil && hc.StoragePath != "" {
+		objectPath := hc.StoragePath + "/config.yaml"
+		if _, err := e.storage.Upload(ctx, objectPath, bytes.NewReader(updatedData), storage.UploadOptions{}); err != nil {
+			return fmt.Errorf("failed to upload updated config.yaml to storage: %w", err)
+		}
+		_, _ = fmt.Fprintf(logger, "Updated config.yaml in storage with image %s\n", outputImage)
+	}
+
+	// Update config.yaml entry in hc.Files manifest with new size and hash.
+	configHash := transfer.HashBytes(updatedData)
+	for i, f := range hc.Files {
+		if f.Path == "config.yaml" {
+			hc.Files[i].Size = int64(len(updatedData))
+			hc.Files[i].Hash = configHash
+			break
+		}
+	}
+	hc.ContentHash = computeContentHash(hc.Files)
+
+	// Update the DB record.
+	if hc.Config == nil {
+		hc.Config = &store.HarnessConfigData{}
+	}
+	hc.Config.Image = outputImage
+	if err := e.store.UpdateHarnessConfig(ctx, hc); err != nil {
+		return fmt.Errorf("failed to update harness-config record: %w", err)
+	}
+	_, _ = fmt.Fprintf(logger, "Updated harness-config record image to %s\n", outputImage)
+
 	return nil
 }
 

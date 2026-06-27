@@ -165,6 +165,10 @@ type AgentAppliedConfig struct {
 	// broker so it can apply the full configuration during agent provisioning.
 	InlineConfig *api.ScionConfig `json:"inlineConfig,omitempty"`
 
+	// NoAuth indicates the agent should start with zero injected credentials.
+	// Stored on the agent record so restarts preserve the intent.
+	NoAuth bool `json:"noAuth,omitempty"`
+
 	// GCPIdentity holds the GCP identity assignment for this agent.
 	GCPIdentity *GCPIdentityConfig `json:"gcpIdentity,omitempty"`
 }
@@ -184,10 +188,52 @@ const (
 // When a git project has the workspace mode label set to "shared", it uses a
 // single shared clone mounted by all agents instead of per-agent clones.
 const (
-	LabelWorkspaceMode    = "scion.dev/workspace-mode"
-	WorkspaceModeShared   = "shared"
-	WorkspaceModePerAgent = "per-agent"
+	LabelWorkspaceMode            = "scion.dev/workspace-mode"
+	WorkspaceModeShared           = "shared"
+	WorkspaceModePerAgent         = "per-agent"
+	WorkspaceModeWorktreePerAgent = "worktree-per-agent"
 )
+
+// WorkspaceSharingMode is the canonical set of workspace sharing modes from the
+// glossary. These three modes govern how workspaces are allocated to agents and
+// determine which storage backend is used (NFS-shared vs node-local).
+type WorkspaceSharingMode string
+
+const (
+	// SharingModeSharedPlain: one workspace directory mounted into every agent,
+	// no per-agent isolation. Used for plain/non-git projects.
+	// Maps from label value "shared".
+	SharingModeSharedPlain WorkspaceSharingMode = "shared-plain"
+
+	// SharingModeClonePerAgent: each agent gets its own full git clone.
+	// Nothing is shared, so this stays on node-local storage (NOT NFS).
+	// Maps from label value "per-agent".
+	SharingModeClonePerAgent WorkspaceSharingMode = "clone-per-agent"
+
+	// SharingModeWorktreePerAgent: each agent gets its own git worktree over
+	// one shared checkout. The shared checkout + all worktrees live on NFS.
+	// Maps from label value "worktree-per-agent".
+	// Note: not yet on Hub-managed projects — reserved for Phase 1+.
+	SharingModeWorktreePerAgent WorkspaceSharingMode = "worktree-per-agent"
+)
+
+// ResolveWorkspaceSharingMode maps a workspace mode label value (wire format) to
+// the canonical WorkspaceSharingMode. Empty or unknown values default to
+// SharingModeSharedPlain for backward compatibility (existing projects without
+// an explicit label are treated as shared).
+func ResolveWorkspaceSharingMode(label string) WorkspaceSharingMode {
+	switch label {
+	case WorkspaceModeShared, "shared-plain":
+		return SharingModeSharedPlain
+	case WorkspaceModePerAgent, "clone-per-agent":
+		return SharingModeClonePerAgent
+	case WorkspaceModeWorktreePerAgent:
+		return SharingModeWorktreePerAgent
+	default:
+		// Empty or unrecognized: default to shared-plain.
+		return SharingModeSharedPlain
+	}
+}
 
 // Project represents a project/agent group in the Hub database.
 type Project struct {
@@ -283,6 +329,12 @@ func (p *Project) IsSharedWorkspace() bool {
 	return p.GitRemote != "" && p.Labels[LabelWorkspaceMode] == WorkspaceModeShared
 }
 
+// IsWorktreePerAgent returns true if this is a git project configured to use
+// per-agent git worktrees over a shared base clone.
+func (p *Project) IsWorktreePerAgent() bool {
+	return p.GitRemote != "" && p.Labels[LabelWorkspaceMode] == WorkspaceModeWorktreePerAgent
+}
+
 // RuntimeBroker represents a compute node in the Hub database.
 type RuntimeBroker struct {
 	// Identity
@@ -307,6 +359,11 @@ type RuntimeBroker struct {
 	// Metadata
 	Labels      map[string]string `json:"labels,omitempty"`
 	Annotations map[string]string `json:"annotations,omitempty"`
+
+	// Affinity — which hub instance currently holds the control-channel socket
+	ConnectedHubID     *string    `json:"connectedHubId,omitempty"`
+	ConnectedSessionID *string    `json:"connectedSessionId,omitempty"`
+	ConnectedAt        *time.Time `json:"connectedAt,omitempty"`
 
 	// Network endpoint (for direct HTTP mode)
 	Endpoint string `json:"endpoint,omitempty"`
@@ -418,14 +475,13 @@ type Template struct {
 	// Inheritance
 	BaseTemplate string `json:"baseTemplate,omitempty"` // Parent template ID (for inheritance)
 
-	// Protection
-	Locked bool   `json:"locked,omitempty"` // Prevent modifications (global templates)
-	Status string `json:"status"`           // pending, active, archived
+	Status string `json:"status"` // pending, active, archived
 
 	// Ownership
 	OwnerID    string `json:"ownerId,omitempty"`
 	CreatedBy  string `json:"createdBy,omitempty"`
 	UpdatedBy  string `json:"updatedBy,omitempty"`
+	SourceURL  string `json:"sourceUrl,omitempty"`
 	Visibility string `json:"visibility"` // private, project, public
 
 	// Timestamps
@@ -513,14 +569,13 @@ type HarnessConfig struct {
 	// File manifest
 	Files []TemplateFile `json:"files,omitempty"` // Manifest of harness config files (reuses TemplateFile)
 
-	// Protection
-	Locked bool   `json:"locked,omitempty"` // Prevent modifications
-	Status string `json:"status"`           // pending, active, archived
+	Status string `json:"status"` // pending, active, archived
 
 	// Ownership
 	OwnerID    string `json:"ownerId,omitempty"`
 	CreatedBy  string `json:"createdBy,omitempty"`
 	UpdatedBy  string `json:"updatedBy,omitempty"`
+	SourceURL  string `json:"sourceUrl,omitempty"`
 	Visibility string `json:"visibility"` // private, project, public
 
 	// Timestamps
@@ -745,6 +800,42 @@ const (
 	BrokerStatusOnline   = "online"
 	BrokerStatusOffline  = "offline"
 	BrokerStatusDegraded = "degraded"
+)
+
+// BrokerDispatch is the durable intent for a lifecycle/create-time command
+// targeted at a broker (design §5.2). The socket-holding node reconciles it:
+// CAS-claim (pending->in_progress) → run the local tunnel op → mark done/failed.
+type BrokerDispatch struct {
+	ID         string     `json:"id"`
+	BrokerID   string     `json:"brokerId"`
+	AgentID    string     `json:"agentId,omitempty"` // empty for project-scoped ops
+	AgentSlug  string     `json:"agentSlug,omitempty"`
+	ProjectID  string     `json:"projectId,omitempty"` // empty if unknown/none
+	Op         string     `json:"op"`                  // start|stop|restart|delete|finalize_env|check_prompt|create|message
+	Args       string     `json:"args,omitempty"`      // JSON
+	State      string     `json:"state"`               // pending|in_progress|done|failed
+	Result     string     `json:"result,omitempty"`    // JSON
+	ClaimedBy  string     `json:"claimedBy,omitempty"` // hub instanceID that reconciled it
+	Attempts   int        `json:"attempts"`
+	Error      string     `json:"error,omitempty"`
+	CreatedAt  time.Time  `json:"createdAt"`
+	UpdatedAt  time.Time  `json:"updatedAt"`
+	DeadlineAt *time.Time `json:"deadlineAt,omitempty"`
+}
+
+// BrokerDispatch.State values.
+const (
+	DispatchStatePending    = "pending"
+	DispatchStateInProgress = "in_progress"
+	DispatchStateDone       = "done"
+	DispatchStateFailed     = "failed"
+)
+
+// Message.DispatchState values (the message row is its own dispatch intent).
+const (
+	MessageDispatchPending    = "pending"
+	MessageDispatchDispatched = "dispatched"
+	MessageDispatchFailed     = "failed"
 )
 
 // =============================================================================
@@ -1161,6 +1252,104 @@ const (
 )
 
 // =============================================================================
+// Lifecycle Hooks (Configurable Agent Lifecycle Hooks)
+// =============================================================================
+
+// LifecycleHook is a Hub database record, authored by hub administrators, that
+// fires an HTTP/webhook action when a matching agent crosses an authoritative
+// phase transition (trigger). It is a sibling of Policy.
+type LifecycleHook struct {
+	// Identity
+	ID   string `json:"id"`   // UUID primary key
+	Name string `json:"name"` // Human-friendly label (not an identity)
+
+	// Scope
+	ScopeType string `json:"scopeType"`         // "hub" (v1); "project" reserved
+	ScopeID   string `json:"scopeId,omitempty"` // Empty for hub scope
+
+	// Selection: which agents this hook applies to (stored as JSON)
+	Selector *LifecycleHookSelector `json:"selector,omitempty"`
+
+	// Trigger: authoritative phase transition that fires the hook.
+	Trigger string `json:"trigger"` // running | suspended | stopped | error
+
+	// Action: HTTP/webhook request to perform (stored as JSON)
+	Action *LifecycleHookAction `json:"action,omitempty"`
+
+	// ExecutionIdentity references the managed GCP service account record ID
+	// (UUID) the hook runs as.
+	ExecutionIdentity string `json:"executionIdentity,omitempty"`
+
+	// Enabled gates whether the hook fires.
+	Enabled bool `json:"enabled"`
+
+	// Timestamps
+	Created time.Time `json:"created"`
+	Updated time.Time `json:"updated"`
+
+	// Authorship
+	CreatedBy string `json:"createdBy,omitempty"`
+
+	// Optimistic locking (existing pattern, mirrors Agent.StateVersion).
+	StateVersion int64 `json:"stateVersion"`
+}
+
+// LifecycleHookSelector describes which agents a lifecycle hook applies to.
+// Matching is performed against attributes persisted on the agent. v1 supports
+// project_id and template; label-based selection is a future enhancement.
+type LifecycleHookSelector struct {
+	ProjectID string `json:"projectId,omitempty"`
+	Template  string `json:"template,omitempty"`
+}
+
+// LifecycleHookAction describes the HTTP/webhook request a lifecycle hook
+// performs when it fires.
+type LifecycleHookAction struct {
+	Type           string            `json:"type,omitempty"` // "http" | "webhook"
+	Method         string            `json:"method,omitempty"`
+	URL            string            `json:"url,omitempty"`
+	Headers        map[string]string `json:"headers,omitempty"`
+	Body           string            `json:"body,omitempty"`
+	OnError        string            `json:"onError,omitempty"`        // "log" (default) | "retry"
+	TimeoutSeconds int               `json:"timeoutSeconds,omitempty"` // Per-action timeout in seconds
+
+	// AllowedUntrustedVars is the admin-curated allow-list of untrusted
+	// variable names that may appear in the action body. Untrusted variables
+	// used anywhere in the action are rejected unless listed here, and even
+	// allow-listed variables are permitted only in the body (never URL
+	// host/path, query, or headers). The admin must consciously opt-in each
+	// untrusted variable, preventing e.g. an agent-controlled callback_url
+	// from being substituted under the service-account's authority.
+	AllowedUntrustedVars []string `json:"allowedUntrustedVars,omitempty"`
+}
+
+// LifecycleHookScopeType constants
+const (
+	LifecycleHookScopeHub     = "hub"
+	LifecycleHookScopeProject = "project"
+)
+
+// LifecycleHookTrigger constants (v1 authoritative phase transitions).
+const (
+	LifecycleHookTriggerRunning   = "running"
+	LifecycleHookTriggerSuspended = "suspended"
+	LifecycleHookTriggerStopped   = "stopped"
+	LifecycleHookTriggerError     = "error"
+)
+
+// LifecycleHookActionType constants (v1).
+const (
+	LifecycleHookActionHTTP    = "http"
+	LifecycleHookActionWebhook = "webhook"
+)
+
+// LifecycleHookActionOnError constants
+const (
+	LifecycleHookOnErrorLog   = "log"
+	LifecycleHookOnErrorRetry = "retry"
+)
+
+// =============================================================================
 // User Access Tokens (UATs)
 // =============================================================================
 
@@ -1350,6 +1539,11 @@ type Message struct {
 	Channel     string    `json:"channel,omitempty"`
 	ThreadID    string    `json:"threadId,omitempty"`
 	CreatedAt   time.Time `json:"createdAt"`
+	// DispatchState tracks cross-node delivery of the message to the broker:
+	// pending|dispatched|failed. The message row is its own durable dispatch
+	// intent (design §5.2/§6.1).
+	DispatchState string     `json:"dispatchState,omitempty"`
+	DispatchedAt  *time.Time `json:"dispatchedAt,omitempty"`
 }
 
 // MarshalJSON implements custom marshaling to support legacy groveId field.
@@ -1455,6 +1649,7 @@ const (
 	ScheduledEventFired     = "fired"
 	ScheduledEventCancelled = "cancelled"
 	ScheduledEventExpired   = "expired" // Loaded on startup past its fire time
+	ScheduledEventFailed    = "failed"
 )
 
 // ScheduledEventFilter for listing events.
@@ -1786,3 +1981,94 @@ func (s *ProjectSyncState) UnmarshalJSON(data []byte) error {
 	}
 	return nil
 }
+
+// =============================================================================
+// Skills (Skill Bank)
+// =============================================================================
+
+// Skill represents a skill record in the Hub database.
+type Skill struct {
+	ID            string    `json:"id"`
+	Name          string    `json:"name"`
+	Slug          string    `json:"slug"`
+	Description   string    `json:"description,omitempty"`
+	Tags          []string  `json:"tags,omitempty"`
+	Scope         string    `json:"scope"`
+	ScopeID       string    `json:"scopeId,omitempty"`
+	StorageURI    string    `json:"storageUri,omitempty"`
+	StorageBucket string    `json:"storageBucket,omitempty"`
+	StoragePath   string    `json:"storagePath,omitempty"`
+	Status        string    `json:"status"`
+	OwnerID       string    `json:"ownerId,omitempty"`
+	CreatedBy     string    `json:"createdBy,omitempty"`
+	UpdatedBy     string    `json:"updatedBy,omitempty"`
+	Visibility    string    `json:"visibility"`
+	Created       time.Time `json:"created"`
+	Updated       time.Time `json:"updated"`
+}
+
+// SkillVersion represents a published version of a skill.
+type SkillVersion struct {
+	ID                 string         `json:"id"`
+	SkillID            string         `json:"skillId"`
+	Version            string         `json:"version"`
+	Status             string         `json:"status"`
+	ContentHash        string         `json:"contentHash,omitempty"`
+	Files              []TemplateFile `json:"files,omitempty"`
+	PublisherID        string         `json:"publisherId,omitempty"`
+	DeprecationMessage string         `json:"deprecationMessage,omitempty"`
+	ReplacementURI     string         `json:"replacementUri,omitempty"`
+	DownloadCount      int64          `json:"downloadCount"`
+	Created            time.Time      `json:"created"`
+}
+
+// SkillRegistry represents an external skill registry for federation.
+type SkillRegistry struct {
+	ID           string            `json:"id"`
+	Name         string            `json:"name"`
+	Endpoint     string            `json:"endpoint"`
+	Description  string            `json:"description,omitempty"`
+	Type         string            `json:"type"`
+	TrustLevel   string            `json:"trustLevel"`
+	AuthToken    string            `json:"-"`
+	ResolvePath  string            `json:"resolvePath,omitempty"`
+	PinnedHashes map[string]string `json:"-"`
+	Status       string            `json:"status"`
+	CreatedBy    string            `json:"createdBy,omitempty"`
+	Created      time.Time         `json:"created"`
+	Updated      time.Time         `json:"updated"`
+}
+
+// SkillRegistryStatus constants
+const (
+	SkillRegistryStatusActive   = "active"
+	SkillRegistryStatusDisabled = "disabled"
+)
+
+// SkillRegistryTrustLevel constants
+const (
+	SkillRegistryTrustTrusted = "trusted"
+	SkillRegistryTrustPinned  = "pinned"
+)
+
+// SkillRegistryType constants
+const (
+	SkillRegistryTypeHub = "hub"
+	SkillRegistryTypeGCP = "gcp"
+)
+
+// SkillScope constants
+const (
+	SkillScopeCore    = "core"
+	SkillScopeGlobal  = "global"
+	SkillScopeProject = "project"
+	SkillScopeUser    = "user"
+)
+
+// SkillVersionStatus constants
+const (
+	SkillVersionStatusDraft      = "draft"
+	SkillVersionStatusPublished  = "published"
+	SkillVersionStatusDeprecated = "deprecated"
+	SkillVersionStatusArchived   = "archived"
+)

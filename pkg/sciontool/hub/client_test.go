@@ -16,10 +16,13 @@ package hub
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -28,53 +31,68 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+// makeJWTWithExpiry builds an unsigned JWT-shaped token whose payload carries the
+// given expiry. ParseTokenExpiry only base64-decodes the payload (it does not
+// verify the signature), so this is enough to drive the refresh loop's
+// expiry-tracking logic in tests.
+func makeJWTWithExpiry(t *testing.T, exp time.Time) string {
+	t.Helper()
+	header := base64.RawURLEncoding.EncodeToString([]byte(`{"alg":"HS256","typ":"JWT"}`))
+	payloadJSON, err := json.Marshal(struct {
+		Exp int64 `json:"exp"`
+	}{Exp: exp.Unix()})
+	require.NoError(t, err)
+	payload := base64.RawURLEncoding.EncodeToString(payloadJSON)
+	return header + "." + payload + ".sig"
+}
+
+// scrubHubEnv clears all Hub-related environment variables for the
+// duration of the test, preventing accidental communication with a
+// real Hub when tests run inside an agent container. See issue #123.
+func scrubHubEnv(t *testing.T) {
+	t.Helper()
+	for _, key := range []string{
+		EnvHubEndpoint,
+		EnvHubURL,
+		EnvHubToken,
+		EnvAgentID,
+		EnvAgentMode,
+	} {
+		t.Setenv(key, "")
+	}
+	t.Cleanup(SetHubTestSandboxed())
+}
+
 func TestNewClient_FromEnvironment(t *testing.T) {
-	// Save and restore env vars
-	origEndpoint := os.Getenv(EnvHubEndpoint)
-	origURL := os.Getenv(EnvHubURL)
-	origToken := os.Getenv(EnvHubToken)
-	origAgentID := os.Getenv(EnvAgentID)
-	defer func() {
-		os.Setenv(EnvHubEndpoint, origEndpoint)
-		os.Setenv(EnvHubURL, origURL)
-		os.Setenv(EnvHubToken, origToken)
-		os.Setenv(EnvAgentID, origAgentID)
-	}()
+	// Clear Hub env vars to prevent leakage from the container (issue #123).
+	scrubHubEnv(t)
 
 	t.Run("missing env vars returns nil", func(t *testing.T) {
-		os.Unsetenv(EnvHubEndpoint)
-		os.Unsetenv(EnvHubURL)
-		os.Unsetenv(EnvHubToken)
-		os.Unsetenv(EnvAgentID)
-
+		scrubHubEnv(t)
 		client := NewClient()
 		assert.Nil(t, client)
 	})
 
 	t.Run("missing token returns nil", func(t *testing.T) {
-		os.Unsetenv(EnvHubEndpoint)
-		os.Setenv(EnvHubURL, "http://hub.example.com")
-		os.Unsetenv(EnvHubToken)
-		os.Unsetenv(EnvAgentID)
-
+		scrubHubEnv(t)
+		t.Setenv(EnvHubURL, "http://hub.example.com")
 		client := NewClient()
 		assert.Nil(t, client)
 	})
 
 	t.Run("missing agentID returns nil", func(t *testing.T) {
-		os.Setenv(EnvHubEndpoint, "http://hub.example.com")
-		os.Setenv(EnvHubToken, "test-token")
-		os.Unsetenv(EnvAgentID)
-
+		scrubHubEnv(t)
+		t.Setenv(EnvHubEndpoint, "http://hub.example.com")
+		t.Setenv(EnvHubToken, "test-token")
 		client := NewClient()
 		assert.Nil(t, client, "should not create client without agent ID (local agent scenario)")
 	})
 
 	t.Run("with all env vars returns client", func(t *testing.T) {
-		os.Unsetenv(EnvHubEndpoint)
-		os.Setenv(EnvHubURL, "http://hub.example.com")
-		os.Setenv(EnvHubToken, "test-token")
-		os.Setenv(EnvAgentID, "agent-123")
+		scrubHubEnv(t)
+		t.Setenv(EnvHubURL, "http://hub.example.com")
+		t.Setenv(EnvHubToken, "test-token")
+		t.Setenv(EnvAgentID, "agent-123")
 
 		client := NewClient()
 		require.NotNil(t, client)
@@ -82,10 +100,11 @@ func TestNewClient_FromEnvironment(t *testing.T) {
 	})
 
 	t.Run("prefers SCION_HUB_ENDPOINT over SCION_HUB_URL", func(t *testing.T) {
-		os.Setenv(EnvHubEndpoint, "http://endpoint.example.com")
-		os.Setenv(EnvHubURL, "http://url.example.com")
-		os.Setenv(EnvHubToken, "test-token")
-		os.Setenv(EnvAgentID, "agent-123")
+		scrubHubEnv(t)
+		t.Setenv(EnvHubEndpoint, "http://endpoint.example.com")
+		t.Setenv(EnvHubURL, "http://url.example.com")
+		t.Setenv(EnvHubToken, "test-token")
+		t.Setenv(EnvAgentID, "agent-123")
 
 		client := NewClient()
 		require.NotNil(t, client)
@@ -93,10 +112,10 @@ func TestNewClient_FromEnvironment(t *testing.T) {
 	})
 
 	t.Run("falls back to SCION_HUB_URL when SCION_HUB_ENDPOINT not set", func(t *testing.T) {
-		os.Unsetenv(EnvHubEndpoint)
-		os.Setenv(EnvHubURL, "http://url.example.com")
-		os.Setenv(EnvHubToken, "test-token")
-		os.Setenv(EnvAgentID, "agent-123")
+		scrubHubEnv(t)
+		t.Setenv(EnvHubURL, "http://url.example.com")
+		t.Setenv(EnvHubToken, "test-token")
+		t.Setenv(EnvAgentID, "agent-123")
 
 		client := NewClient()
 		require.NotNil(t, client)
@@ -261,31 +280,25 @@ func TestClient_Heartbeat(t *testing.T) {
 }
 
 func TestIsHostedMode(t *testing.T) {
-	origMode := os.Getenv(EnvAgentMode)
-	defer os.Setenv(EnvAgentMode, origMode)
-
 	t.Run("not hosted mode", func(t *testing.T) {
-		os.Unsetenv(EnvAgentMode)
+		t.Setenv(EnvAgentMode, "")
 		assert.False(t, IsHostedMode())
 
-		os.Setenv(EnvAgentMode, "solo")
+		t.Setenv(EnvAgentMode, "solo")
 		assert.False(t, IsHostedMode())
 	})
 
 	t.Run("hosted mode", func(t *testing.T) {
-		os.Setenv(EnvAgentMode, "hosted")
+		t.Setenv(EnvAgentMode, "hosted")
 		assert.True(t, IsHostedMode())
 	})
 }
 
 func TestGetAgentID(t *testing.T) {
-	origID := os.Getenv(EnvAgentID)
-	defer os.Setenv(EnvAgentID, origID)
-
-	os.Setenv(EnvAgentID, "test-agent-id")
+	t.Setenv(EnvAgentID, "test-agent-id")
 	assert.Equal(t, "test-agent-id", GetAgentID())
 
-	os.Unsetenv(EnvAgentID)
+	t.Setenv(EnvAgentID, "")
 	assert.Equal(t, "", GetAgentID())
 }
 
@@ -623,6 +636,12 @@ func TestClient_GetToken(t *testing.T) {
 
 func TestClient_StartTokenRefresh(t *testing.T) {
 	t.Run("refreshes token at scheduled time", func(t *testing.T) {
+		// Isolate the token file to a temp dir. Without this, RefreshToken's
+		// WriteTokenFile would clobber the real ~/.scion/scion-token when the
+		// suite is run inside an agent container (where the scion user exists).
+		cleanup := SetTokenHome(t.TempDir())
+		defer cleanup()
+
 		refreshed := false
 		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			refreshed = true
@@ -674,19 +693,129 @@ func TestClient_StartTokenRefresh(t *testing.T) {
 			t.Fatal("token refresh loop did not exit after context cancellation")
 		}
 	})
+
+	t.Run("retries after a transient failure then recovers", func(t *testing.T) {
+		cleanup := SetTokenHome(t.TempDir())
+		defer cleanup()
+
+		var calls int32
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			// First attempt fails transiently (503); the second succeeds.
+			if atomic.AddInt32(&calls, 1) == 1 {
+				w.WriteHeader(http.StatusServiceUnavailable)
+				w.Write([]byte("temporarily down"))
+				return
+			}
+			futureExpiry := time.Now().Add(10 * time.Hour).UTC().Format(time.RFC3339)
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			w.Write([]byte(`{"token":"recovered-token","expires_at":"` + futureExpiry + `"}`))
+		}))
+		defer server.Close()
+
+		client := NewClientWithConfig(server.URL, "old-token", "agent-123")
+
+		var errCount int32
+		refreshed := make(chan struct{}, 1)
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+
+		done := client.StartTokenRefresh(ctx, &TokenRefreshConfig{
+			RefreshAt:      time.Now(),
+			Timeout:        time.Second,
+			RetryBaseDelay: 10 * time.Millisecond,
+			RetryMaxDelay:  10 * time.Millisecond,
+			OnError:        func(error) { atomic.AddInt32(&errCount, 1) },
+			OnRefreshed: func(time.Time) {
+				select {
+				case refreshed <- struct{}{}:
+				default:
+				}
+			},
+		})
+
+		select {
+		case <-refreshed:
+			// Recovered after the transient failure.
+		case <-time.After(time.Second):
+			t.Fatal("token refresh did not recover after a transient failure")
+		}
+
+		assert.Equal(t, "recovered-token", client.GetToken())
+		assert.GreaterOrEqual(t, atomic.LoadInt32(&errCount), int32(1), "transient failure should invoke OnError")
+
+		cancel()
+		<-done
+	})
+
+	t.Run("auth lost fires once and keeps retrying", func(t *testing.T) {
+		cleanup := SetTokenHome(t.TempDir())
+		defer cleanup()
+
+		// The current token is already expired, so the first failed refresh is a
+		// terminal auth loss. The server always rejects with 401 (as it would
+		// after a hub signing-key rotation).
+		expiredToken := makeJWTWithExpiry(t, time.Now().Add(-time.Minute))
+
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusUnauthorized)
+			w.Write([]byte("invalid agent token: failed to verify token"))
+		}))
+		defer server.Close()
+
+		client := NewClientWithConfig(server.URL, expiredToken, "agent-123")
+
+		var errCount, authLostCount int32
+		var sawUnauthorized atomic.Bool
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+
+		done := client.StartTokenRefresh(ctx, &TokenRefreshConfig{
+			RefreshAt:      time.Now(),
+			Timeout:        time.Second,
+			RetryBaseDelay: 10 * time.Millisecond,
+			RetryMaxDelay:  10 * time.Millisecond,
+			OnError: func(err error) {
+				atomic.AddInt32(&errCount, 1)
+				if errors.Is(err, ErrTokenRefreshUnauthorized) {
+					sawUnauthorized.Store(true)
+				}
+			},
+			OnAuthLost: func() { atomic.AddInt32(&authLostCount, 1) },
+		})
+
+		// Let several retries elapse.
+		require.Eventually(t, func() bool {
+			return atomic.LoadInt32(&errCount) >= 3
+		}, time.Second, 5*time.Millisecond, "expected the loop to keep retrying")
+
+		// The loop must still be running (not exited) despite the auth loss.
+		select {
+		case <-done:
+			t.Fatal("refresh loop exited instead of continuing to retry after auth loss")
+		default:
+		}
+
+		cancel()
+		<-done
+
+		assert.Equal(t, int32(1), atomic.LoadInt32(&authLostCount), "OnAuthLost should fire exactly once")
+		assert.True(t, sawUnauthorized.Load(), "401 refresh error should wrap ErrTokenRefreshUnauthorized")
+	})
+}
+
+func TestTokenRefreshBackoff(t *testing.T) {
+	base := 30 * time.Second
+	max := 5 * time.Minute
+
+	assert.Equal(t, base, tokenRefreshBackoff(0, base, max), "non-positive failures clamps to one attempt")
+	assert.Equal(t, base, tokenRefreshBackoff(1, base, max))
+	assert.Equal(t, 2*base, tokenRefreshBackoff(2, base, max))
+	assert.Equal(t, 4*base, tokenRefreshBackoff(3, base, max))
+	assert.Equal(t, max, tokenRefreshBackoff(10, base, max), "backoff is capped at max")
 }
 
 func TestOperatingMode(t *testing.T) {
-	// Save and restore env vars
-	origEndpoint := os.Getenv(EnvHubEndpoint)
-	origURL := os.Getenv(EnvHubURL)
-	origMode := os.Getenv(EnvAgentMode)
-	defer func() {
-		os.Setenv(EnvHubEndpoint, origEndpoint)
-		os.Setenv(EnvHubURL, origURL)
-		os.Setenv(EnvAgentMode, origMode)
-	}()
-
 	tests := []struct {
 		name         string
 		endpoint     string
@@ -747,17 +876,16 @@ func TestOperatingMode(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			os.Unsetenv(EnvHubEndpoint)
-			os.Unsetenv(EnvHubURL)
-			os.Unsetenv(EnvAgentMode)
+			// Clear Hub env, then set test values (issue #123).
+			scrubHubEnv(t)
 			if tt.endpoint != "" {
-				os.Setenv(EnvHubEndpoint, tt.endpoint)
+				t.Setenv(EnvHubEndpoint, tt.endpoint)
 			}
 			if tt.hubURL != "" {
-				os.Setenv(EnvHubURL, tt.hubURL)
+				t.Setenv(EnvHubURL, tt.hubURL)
 			}
 			if tt.agentMode != "" {
-				os.Setenv(EnvAgentMode, tt.agentMode)
+				t.Setenv(EnvAgentMode, tt.agentMode)
 			}
 
 			mode := OperatingMode()
@@ -768,20 +896,8 @@ func TestOperatingMode(t *testing.T) {
 }
 
 func TestOperatingMode_Defaults(t *testing.T) {
-	// Save and restore env vars
-	origEndpoint := os.Getenv(EnvHubEndpoint)
-	origURL := os.Getenv(EnvHubURL)
-	origMode := os.Getenv(EnvAgentMode)
-	defer func() {
-		os.Setenv(EnvHubEndpoint, origEndpoint)
-		os.Setenv(EnvHubURL, origURL)
-		os.Setenv(EnvAgentMode, origMode)
-	}()
-
-	// Clear all relevant env vars
-	os.Unsetenv(EnvHubEndpoint)
-	os.Unsetenv(EnvHubURL)
-	os.Unsetenv(EnvAgentMode)
+	// Clear all relevant env vars (issue #123).
+	scrubHubEnv(t)
 
 	mode := OperatingMode()
 	assert.Equal(t, ModeLocal, mode, "should default to ModeLocal when no env vars are set")
@@ -818,18 +934,11 @@ func TestNewClient_UsesTokenFile(t *testing.T) {
 	cleanup := SetTokenHome(t.TempDir())
 	defer cleanup()
 
-	origEndpoint := os.Getenv(EnvHubEndpoint)
-	origToken := os.Getenv(EnvHubToken)
-	origAgentID := os.Getenv(EnvAgentID)
-	defer func() {
-		os.Setenv(EnvHubEndpoint, origEndpoint)
-		os.Setenv(EnvHubToken, origToken)
-		os.Setenv(EnvAgentID, origAgentID)
-	}()
-
-	os.Setenv(EnvHubEndpoint, "http://hub.example.com")
-	os.Setenv(EnvHubToken, "original-env-token")
-	os.Setenv(EnvAgentID, "agent-123")
+	// Clear Hub env, then set test values (issue #123).
+	scrubHubEnv(t)
+	t.Setenv(EnvHubEndpoint, "http://hub.example.com")
+	t.Setenv(EnvHubToken, "original-env-token")
+	t.Setenv(EnvAgentID, "agent-123")
 
 	t.Run("uses env token when no file exists", func(t *testing.T) {
 		client := NewClient()
@@ -974,27 +1083,21 @@ func TestGitHubTokenFile_WriteAndRead(t *testing.T) {
 }
 
 func TestIsGitHubAppEnabled(t *testing.T) {
-	orig := os.Getenv(EnvGitHubAppEnabled)
-	defer os.Setenv(EnvGitHubAppEnabled, orig)
-
-	os.Unsetenv(EnvGitHubAppEnabled)
+	t.Setenv(EnvGitHubAppEnabled, "")
 	assert.False(t, IsGitHubAppEnabled())
 
-	os.Setenv(EnvGitHubAppEnabled, "false")
+	t.Setenv(EnvGitHubAppEnabled, "false")
 	assert.False(t, IsGitHubAppEnabled())
 
-	os.Setenv(EnvGitHubAppEnabled, "true")
+	t.Setenv(EnvGitHubAppEnabled, "true")
 	assert.True(t, IsGitHubAppEnabled())
 }
 
 func TestGitHubTokenPath(t *testing.T) {
-	orig := os.Getenv(EnvGitHubTokenPath)
-	defer os.Setenv(EnvGitHubTokenPath, orig)
-
-	os.Unsetenv(EnvGitHubTokenPath)
+	t.Setenv(EnvGitHubTokenPath, "")
 	assert.Equal(t, DefaultGitHubTokenPath, GitHubTokenPath())
 
-	os.Setenv(EnvGitHubTokenPath, "/custom/path/token")
+	t.Setenv(EnvGitHubTokenPath, "/custom/path/token")
 	assert.Equal(t, "/custom/path/token", GitHubTokenPath())
 }
 
@@ -1172,6 +1275,46 @@ func TestStartGitHubTokenRefresh_WritesExpiryFile(t *testing.T) {
 	assert.False(t, IsGitHubTokenExpired(tokenPath))
 }
 
+func TestStartGitHubTokenRefresh_CallsOnRefreshedAfterEnvUpdate(t *testing.T) {
+	tmpDir := t.TempDir()
+	tokenPath := tmpDir + "/github-token"
+
+	t.Setenv("GITHUB_TOKEN", "ghs_original_stale")
+
+	futureExpiry := time.Now().Add(1 * time.Hour).UTC()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(map[string]string{
+			"token":      "ghs_fresh_token",
+			"expires_at": futureExpiry.Format(time.RFC3339),
+		})
+	}))
+	defer server.Close()
+
+	client := NewClientWithConfig(server.URL, "hub-token", "agent-123")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+	defer cancel()
+
+	var callbackToken string
+	done := client.StartGitHubTokenRefresh(ctx, &GitHubTokenRefreshConfig{
+		RefreshAt: time.Now(),
+		TokenPath: tokenPath,
+		OnRefreshed: func(newToken string, newExpiry time.Time) {
+			// At callback time, GITHUB_TOKEN env var should already be updated
+			callbackToken = newToken
+			assert.Equal(t, "ghs_fresh_token", os.Getenv("GITHUB_TOKEN"),
+				"GITHUB_TOKEN env var should be updated before OnRefreshed is called")
+		},
+	})
+
+	<-done
+
+	assert.Equal(t, "ghs_fresh_token", callbackToken,
+		"OnRefreshed callback should have been called with the new token")
+}
+
 func TestClient_StartHeartbeat_DefaultConfig(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
@@ -1186,4 +1329,96 @@ func TestClient_StartHeartbeat_DefaultConfig(t *testing.T) {
 	// Should work with nil config (uses defaults)
 	done := client.StartHeartbeat(ctx, nil)
 	<-done
+}
+
+func TestClient_SetSecret_Created(t *testing.T) {
+	var receivedReq SetSecretRequest
+	var receivedToken string
+	var receivedMethod string
+	var receivedPath string
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		receivedMethod = r.Method
+		receivedPath = r.URL.Path
+		receivedToken = r.Header.Get("X-Scion-Agent-Token")
+		if err := json.NewDecoder(r.Body).Decode(&receivedReq); err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusCreated)
+		_ = json.NewEncoder(w).Encode(SetSecretResponse{
+			Key:     "MY_KEY",
+			Scope:   "project",
+			ScopeID: "project-123",
+		})
+	}))
+	defer server.Close()
+
+	client := NewClientWithConfig(server.URL, "test-token", "agent-123")
+	resp, err := client.SetSecret(context.Background(), "MY_KEY", "c2VjcmV0", "file", "~/.config/auth.json", false)
+
+	require.NoError(t, err)
+	assert.Equal(t, http.MethodPut, receivedMethod)
+	assert.Equal(t, "/api/v1/agents/agent-123/secrets/MY_KEY", receivedPath)
+	assert.Equal(t, "test-token", receivedToken)
+	assert.Equal(t, "c2VjcmV0", receivedReq.Value)
+	assert.Equal(t, "file", receivedReq.Type)
+	assert.Equal(t, "~/.config/auth.json", receivedReq.Target)
+	assert.False(t, receivedReq.Force)
+
+	require.NotNil(t, resp)
+	assert.Equal(t, "MY_KEY", resp.Key)
+	assert.Equal(t, "project", resp.Scope)
+	assert.Equal(t, "project-123", resp.ScopeID)
+}
+
+func TestClient_SetSecret_NoContent(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer server.Close()
+
+	client := NewClientWithConfig(server.URL, "test-token", "agent-123")
+	resp, err := client.SetSecret(context.Background(), "MY_KEY", "dmFsdWU=", "", "", true)
+
+	require.NoError(t, err)
+	require.NotNil(t, resp)
+	assert.Equal(t, "MY_KEY", resp.Key)
+	assert.Equal(t, "project", resp.Scope)
+}
+
+func TestClient_SetSecret_Conflict(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusConflict)
+		_, _ = w.Write([]byte(`{"error":"exists"}`))
+	}))
+	defer server.Close()
+
+	client := NewClientWithConfig(server.URL, "test-token", "agent-123")
+	_, err := client.SetSecret(context.Background(), "MY_KEY", "dmFsdWU=", "", "", false)
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "already exists")
+}
+
+func TestClient_SetSecret_NotConfigured(t *testing.T) {
+	client := &Client{}
+	_, err := client.SetSecret(context.Background(), "KEY", "VAL", "", "", false)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "not configured")
+}
+
+func TestClient_SetSecret_ServerError(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+		_, _ = w.Write([]byte("internal error"))
+	}))
+	defer server.Close()
+
+	client := NewClientWithConfig(server.URL, "test-token", "agent-123")
+	_, err := client.SetSecret(context.Background(), "KEY", "dmFsdWU=", "", "", false)
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "500")
 }

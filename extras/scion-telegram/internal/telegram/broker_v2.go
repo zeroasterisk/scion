@@ -37,6 +37,7 @@ import (
 	"github.com/GoogleCloudPlatform/scion/pkg/apiclient"
 	"github.com/GoogleCloudPlatform/scion/pkg/messages"
 	"github.com/GoogleCloudPlatform/scion/pkg/plugin"
+	"github.com/GoogleCloudPlatform/scion/pkg/projectcompat"
 )
 
 const (
@@ -91,6 +92,10 @@ type TelegramBrokerV2 struct {
 	InboundHandler func(topic string, msg *messages.StructuredMessage)
 
 	hostCallbacks plugin.HostCallbacks
+
+	errorCooldown           map[string]time.Time // key: "chatID:threadID:errorType" → last sent time
+	errorCooldownMu         sync.Mutex
+	errorCooldownCheckCount int
 }
 
 // NewV2 creates a new TelegramBrokerV2 with the given logger.
@@ -105,6 +110,7 @@ func NewV2(log *slog.Logger) *TelegramBrokerV2 {
 		pluginName:    "telegram",
 		httpClient:    &http.Client{Timeout: 10 * time.Second},
 		agentCacheTTL: defaultAgentCacheTTL,
+		errorCooldown: make(map[string]time.Time),
 	}
 }
 
@@ -447,19 +453,24 @@ func (b *TelegramBrokerV2) importV1UserMappings(ctx context.Context, mappingsJSO
 	}
 }
 
-// parseTopicComponents extracts projectID and agentSlug from a topic string.
-// Example: "scion.grove.myproj.agent.coder.messages" → ("myproj", "coder")
+// parseTopicComponents extracts projectID and agentSlug from a broker topic.
+// Legacy scion.grove topics are accepted by projectcompat at this adapter boundary.
 func parseTopicComponents(topic string) (projectID, agentSlug string) {
-	parts := strings.Split(topic, ".")
-	for i, part := range parts {
-		if part == "grove" && i+1 < len(parts) {
-			projectID = parts[i+1]
+	parsed, err := projectcompat.ParseTopic(topic)
+	if err == nil {
+		projectID = parsed.ProjectID
+		if parsed.Kind == projectcompat.TopicKindAgent {
+			agentSlug = parsed.Actor
 		}
-		if part == "project" && i+1 < len(parts) {
-			projectID = parts[i+1]
-		}
-		if part == "agent" && i+1 < len(parts) {
-			agentSlug = parts[i+1]
+	} else {
+		parts := strings.Split(topic, ".")
+		for i, part := range parts {
+			if (part == "grove" || part == "project") && i+1 < len(parts) {
+				projectID = parts[i+1]
+			}
+			if part == "agent" && i+1 < len(parts) {
+				agentSlug = parts[i+1]
+			}
 		}
 	}
 	if projectID == "" {
@@ -689,21 +700,28 @@ func (b *TelegramBrokerV2) Publish(ctx context.Context, topic string, msg *messa
 		}
 	}
 
+	// Determine thread ID for Telegram forum topics.
+	var threadOpts []SendOption
+	if msg != nil && msg.ThreadID != "" {
+		if tid, err := strconv.ParseInt(msg.ThreadID, 10, 64); err == nil && tid != 0 {
+			threadOpts = append(threadOpts, SendOption{MessageThreadID: tid})
+		}
+	}
+
 	var errs []error
 	for _, chatID := range chatIDs {
 		var err error
 		if sq != nil {
 			var keyboard *InlineKeyboardMarkup
 			if replyToMsgID > 0 {
-				// Pass nil keyboard but use replyTo.
-				_, err = sq.Send(ctx, chatID, text, "", keyboard, replyToMsgID)
+				_, err = sq.Send(ctx, chatID, text, "", keyboard, replyToMsgID, threadOpts...)
 			} else {
-				_, err = sq.Send(ctx, chatID, text, "", nil, 0)
+				_, err = sq.Send(ctx, chatID, text, "", nil, 0, threadOpts...)
 			}
 		} else if replyToMsgID > 0 {
-			_, err = api.SendMessageWithKeyboard(ctx, chatID, text, "", nil, replyToMsgID)
+			_, err = api.SendMessageWithKeyboard(ctx, chatID, text, "", nil, replyToMsgID, threadOpts...)
 		} else {
-			_, err = api.SendMessage(ctx, chatID, text, "")
+			_, err = api.SendMessage(ctx, chatID, text, "", threadOpts...)
 		}
 		if err != nil {
 			var apiErr *APIError
@@ -715,9 +733,32 @@ func (b *TelegramBrokerV2) Publish(ctx context.Context, topic string, msg *messa
 				continue
 			}
 			if errors.As(err, &apiErr) && apiErr.IsMigrated() {
-				b.log.Warn("Group upgraded to supergroup, skipping message",
-					"old_chat_id", chatID, "new_chat_id", apiErr.MigrateToChatID)
-				continue // TODO: migrate group_links record to new chat_id
+				newChatID := apiErr.MigrateToChatID
+				b.log.Info("Group upgraded to supergroup, migrating",
+					"old_chat_id", chatID, "new_chat_id", newChatID)
+				if store != nil {
+					if merr := store.MigrateGroupLink(ctx, chatID, newChatID); merr != nil {
+						b.log.Error("Failed to migrate group_link", "error", merr)
+					}
+				}
+				// Retry send with the new chat_id.
+				if sq != nil {
+					var keyboard *InlineKeyboardMarkup
+					if replyToMsgID > 0 {
+						_, err = sq.Send(ctx, newChatID, text, "", keyboard, replyToMsgID, threadOpts...)
+					} else {
+						_, err = sq.Send(ctx, newChatID, text, "", nil, 0, threadOpts...)
+					}
+				} else if replyToMsgID > 0 {
+					_, err = api.SendMessageWithKeyboard(ctx, newChatID, text, "", nil, replyToMsgID, threadOpts...)
+				} else {
+					_, err = api.SendMessage(ctx, newChatID, text, "", threadOpts...)
+				}
+				if err != nil {
+					b.log.Error("Retry after migration failed", "chat_id", newChatID, "error", err)
+					errs = append(errs, err)
+				}
+				continue
 			}
 			b.log.Error("Failed to send Telegram message",
 				"chat_id", chatID, "error", err)
@@ -857,9 +898,42 @@ func (b *TelegramBrokerV2) publishInputNeeded(ctx context.Context, api *Telegram
 				continue
 			}
 			if errors.As(err, &apiErr) && apiErr.IsMigrated() {
-				b.log.Warn("Group upgraded to supergroup, skipping input-needed",
-					"old_chat_id", chatID, "new_chat_id", apiErr.MigrateToChatID)
-				continue // TODO: migrate group_links record to new chat_id
+				newChatID := apiErr.MigrateToChatID
+				b.log.Info("Group upgraded to supergroup, migrating",
+					"old_chat_id", chatID, "new_chat_id", newChatID)
+				if b.store != nil {
+					if merr := b.store.MigrateGroupLink(ctx, chatID, newChatID); merr != nil {
+						b.log.Error("Failed to migrate group_link", "error", merr)
+					}
+				}
+				// Retry send with the new chat_id.
+				keyboard = buildAskUserKeyboard(requestID, choices)
+				if sq != nil {
+					sent, err = sq.Send(ctx, newChatID, text, "", keyboard, 0)
+				} else if keyboard == nil {
+					sent, err = api.SendMessage(ctx, newChatID, text, "")
+				} else {
+					sent, err = api.SendMessageWithKeyboard(ctx, newChatID, text, "", keyboard, 0)
+				}
+				if err != nil {
+					b.log.Error("Retry after migration failed", "chat_id", newChatID, "error", err)
+					errs = append(errs, err)
+					continue
+				}
+				// Save PendingAskUser with the new chat_id.
+				pending := &PendingAskUser{
+					RequestID: requestID,
+					MessageID: sent.MessageID,
+					ChatID:    newChatID,
+					AgentSlug: agentSlug,
+					ProjectID: projectID,
+					Choices:   choices,
+					ExpiresAt: time.Now().Add(askUserExpiry),
+				}
+				if perr := b.store.SavePendingAskUser(ctx, pending); perr != nil {
+					b.log.Error("Failed to save pending ask user after migration", "error", perr)
+				}
+				continue
 			}
 			b.log.Error("Failed to send input-needed message",
 				"chat_id", chatID, "error", err)
@@ -1535,8 +1609,18 @@ func (b *TelegramBrokerV2) handleGroupMessage(tgMsg *TGMessage) {
 	}
 	b.mu.RUnlock()
 
+	// Resolve effective default agent: topic-level override first, then chat-level.
+	effectiveDefault := link.DefaultAgent
+	if tgMsg.MessageThreadID != 0 {
+		if topicDefault, err := b.store.GetTopicDefault(ctx, chatID, tgMsg.MessageThreadID); err != nil {
+			b.log.Error("Failed to get topic default", "error", err)
+		} else if topicDefault != "" {
+			effectiveDefault = topicDefault
+		}
+	}
+
 	// Resolve target agents from @-mentions.
-	targets, isAll := resolveTargetAgents(tgMsg, botUsername, link.DefaultAgent, agents)
+	targets, isAll := resolveTargetAgents(tgMsg, botUsername, effectiveDefault, agents)
 
 	// Fallback 1: reply-to-bot-message — extract the agent from the replied-to message.
 	if len(targets) == 0 && tgMsg.ReplyToMessage != nil {
@@ -1590,13 +1674,29 @@ func (b *TelegramBrokerV2) handleGroupMessage(tgMsg *TGMessage) {
 	// Telegram user — that's a user-to-user message. Mentions embedded
 	// later (offset>0) do not block default routing; resolveUserMentions
 	// injects the resolved scion identity for those.
-	if len(targets) == 0 && link.DefaultAgent != "" {
+	if len(targets) == 0 && effectiveDefault != "" {
 		hasAttachment := tgMsg.Photo != nil || tgMsg.Document != nil
 		text := strings.TrimSpace(tgMsg.Text)
 		textRoutes := text != "" && !strings.HasPrefix(text, "/") && !strings.HasPrefix(text, "@") && !hasNonBotUserMention(tgMsg, botUsername, agents)
 		if textRoutes || hasAttachment {
-			b.log.Debug("Using default agent", "agent", link.DefaultAgent)
-			targets = []string{link.DefaultAgent}
+			// Validate default agent against the cached agent list before routing.
+			if !slices.Contains(agents, effectiveDefault) {
+				threadID := 0
+				if tgMsg.MessageThreadID != 0 {
+					threadID = int(tgMsg.MessageThreadID)
+				}
+				if !b.shouldSuppressError(chatID, threadID, "default_agent_not_found") {
+					replyTo := ""
+					if tgMsg.MessageID != 0 {
+						replyTo = strconv.FormatInt(int64(tgMsg.MessageID), 10)
+					}
+					errMsg := fmt.Sprintf("Default agent %q is no longer available. Use /agents to see available agents, or /default to change the default.", effectiveDefault)
+					b.api.SendMessage(ctx, chatID, errMsg, replyTo) //nolint:errcheck
+				}
+				return
+			}
+			b.log.Debug("Using default agent", "agent", effectiveDefault)
+			targets = []string{effectiveDefault}
 		}
 	}
 
@@ -1720,7 +1820,7 @@ func (b *TelegramBrokerV2) handleGroupMessage(tgMsg *TGMessage) {
 			}
 		}
 
-		topic := fmt.Sprintf("scion.project.%s.agent.%s.messages", link.ProjectID, agentSlug)
+		topic := projectcompat.AgentTopic(link.ProjectID, agentSlug)
 		recipient := "agent:" + agentSlug
 
 		msg := &messages.StructuredMessage{
@@ -1760,7 +1860,26 @@ func (b *TelegramBrokerV2) handleGroupMessage(tgMsg *TGMessage) {
 		b.log.Debug("Delivering inbound message",
 			"topic", topic, "sender", sender, "agent", agentSlug)
 
-		b.deliverInbound(topic, msg)
+		statusCode, deliveryErr := b.deliverInboundWithFeedback(ctx, topic, msg)
+		if statusCode >= 400 && deliveryErr != "" {
+			threadID := 0
+			if tgMsg.MessageThreadID != 0 {
+				threadID = int(tgMsg.MessageThreadID)
+			}
+			errorType := "delivery_error"
+			if statusCode == http.StatusNotFound {
+				errorType = "agent_not_found"
+			} else if statusCode == http.StatusForbidden {
+				errorType = "permission_denied"
+			}
+			if !b.shouldSuppressError(chatID, threadID, errorType) {
+				replyTo := ""
+				if tgMsg.MessageID != 0 {
+					replyTo = strconv.FormatInt(int64(tgMsg.MessageID), 10)
+				}
+				b.api.SendMessage(ctx, chatID, "Message delivery failed: "+deliveryErr, replyTo) //nolint:errcheck
+			}
+		}
 	}
 }
 
@@ -1960,7 +2079,7 @@ func (b *TelegramBrokerV2) handleCallbackQuery(ctx context.Context, cb *Callback
 	}
 
 	// Deliver the ask-user response to the hub.
-	topic := fmt.Sprintf("scion.project.%s.agent.%s.messages", resp.ProjectID, resp.AgentSlug)
+	topic := projectcompat.AgentTopic(resp.ProjectID, resp.AgentSlug)
 
 	// Determine sender identity from the callback user.
 	sender := "telegram:unknown"
@@ -2033,7 +2152,7 @@ func (b *TelegramBrokerV2) getProjectAgents(ctx context.Context, projectID strin
 // --- Dynamic subscription management ---
 
 func (b *TelegramBrokerV2) subscribeForProject(projectID string) {
-	pattern := fmt.Sprintf("scion.project.%s.>", projectID)
+	pattern := projectcompat.ProjectPattern(projectID)
 
 	b.mu.RLock()
 	hc := b.hostCallbacks
@@ -2048,7 +2167,7 @@ func (b *TelegramBrokerV2) subscribeForProject(projectID string) {
 }
 
 func (b *TelegramBrokerV2) unsubscribeForProject(projectID string) {
-	pattern := fmt.Sprintf("scion.project.%s.>", projectID)
+	pattern := projectcompat.ProjectPattern(projectID)
 
 	b.mu.RLock()
 	hc := b.hostCallbacks
@@ -2122,6 +2241,116 @@ func (b *TelegramBrokerV2) deliverInbound(topic string, msg *messages.Structured
 		b.log.Error("Hub rejected inbound message",
 			"status", resp.StatusCode, "topic", topic)
 	}
+}
+
+const errorCooldownDuration = 5 * time.Minute
+
+// shouldSuppressError checks whether an error of the given type was already
+// reported to the given chat+thread within the cooldown window. If not, it
+// records the current time and returns false (do not suppress).
+func (b *TelegramBrokerV2) shouldSuppressError(chatID int64, threadID int, errorType string) bool {
+	key := fmt.Sprintf("%d:%d:%s", chatID, threadID, errorType)
+
+	b.errorCooldownMu.Lock()
+	defer b.errorCooldownMu.Unlock()
+
+	now := time.Now()
+
+	b.errorCooldownCheckCount++
+	if len(b.errorCooldown) > 1000 && b.errorCooldownCheckCount%100 == 0 {
+		for k, v := range b.errorCooldown {
+			if now.Sub(v) >= errorCooldownDuration {
+				delete(b.errorCooldown, k)
+			}
+		}
+	}
+
+	if last, ok := b.errorCooldown[key]; ok && now.Sub(last) < errorCooldownDuration {
+		return true
+	}
+	b.errorCooldown[key] = now
+	return false
+}
+
+// deliverInboundWithFeedback delivers an inbound message to the Hub and
+// returns the HTTP status code and parsed error message (if any) so the
+// caller can report delivery failures back to the originating chat.
+func (b *TelegramBrokerV2) deliverInboundWithFeedback(ctx context.Context, topic string, msg *messages.StructuredMessage) (statusCode int, errMsg string) {
+	b.mu.RLock()
+	handler := b.InboundHandler
+	hubURL := b.hubURL
+	hmacKey := b.hmacKey
+	brokerID := b.brokerID
+	pluginName := b.pluginName
+	b.mu.RUnlock()
+
+	if handler != nil {
+		handler(topic, msg)
+		return http.StatusOK, ""
+	}
+
+	if hubURL == "" {
+		b.log.Debug("No hub URL configured, dropping inbound message", "topic", topic)
+		return http.StatusOK, ""
+	}
+
+	payload := inboundPayload{
+		Topic:   topic,
+		Message: msg,
+	}
+	body, err := json.Marshal(payload)
+	if err != nil {
+		b.log.Error("Failed to marshal inbound message", "error", err)
+		return http.StatusInternalServerError, "internal error"
+	}
+
+	inboundURL := hubURL + "/api/v1/broker/inbound"
+	req, err := http.NewRequestWithContext(ctx, "POST", inboundURL, bytes.NewReader(body))
+	if err != nil {
+		b.log.Error("Failed to create inbound request", "error", err)
+		return http.StatusInternalServerError, "internal error"
+	}
+	req.ContentLength = int64(len(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Scion-Plugin-Name", pluginName)
+
+	if brokerID != "" && hmacKey != "" {
+		if err := signInboundRequest(req, brokerID, hmacKey); err != nil {
+			b.log.Error("Failed to sign inbound request", "error", err)
+			return http.StatusInternalServerError, "internal error"
+		}
+	}
+
+	resp, err := b.httpClient.Do(req)
+	if err != nil {
+		b.log.Error("Failed to deliver inbound message", "error", err, "topic", topic)
+		return http.StatusBadGateway, "delivery failed"
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode >= 400 {
+		b.log.Error("Hub rejected inbound message",
+			"status", resp.StatusCode, "topic", topic)
+		// Parse the Hub error response for a human-readable message.
+		var hubErr struct {
+			Error struct {
+				Message string                 `json:"message"`
+				Code    string                 `json:"code"`
+				Details map[string]interface{} `json:"details,omitempty"`
+			} `json:"error"`
+		}
+		if decErr := json.NewDecoder(resp.Body).Decode(&hubErr); decErr == nil && hubErr.Error.Message != "" {
+			errDetail := hubErr.Error.Message
+			if rem, ok := hubErr.Error.Details["remediation"].(string); ok && rem != "" {
+				errDetail += " " + rem
+			}
+			return resp.StatusCode, errDetail
+		}
+		return resp.StatusCode, fmt.Sprintf("delivery failed (HTTP %d)", resp.StatusCode)
+	}
+
+	io.Copy(io.Discard, resp.Body)
+	return resp.StatusCode, ""
 }
 
 // signInboundRequest signs an HTTP request with HMAC auth.
@@ -2201,7 +2430,7 @@ func FormatMessageV2(msg *messages.StructuredMessage, agentSlug string, recipien
 	}
 
 	b.WriteString("\n\n")
-	b.WriteString(msg.Msg)
+	b.WriteString(unescapeNewlines(msg.Msg))
 
 	text := b.String()
 	return truncateMessage(text)

@@ -99,22 +99,24 @@ fi
 
 # Prompt for size (only needed if creating the instance)
 if [[ "${INSTANCE_EXISTS}" == "false" ]]; then
-    if [[ -z "${SIZE_CHOICE:-}" ]]; then
-        echo "Choose instance size:"
-        echo "1) Small  (10s of agents)  - e2-standard-4 (4 vCPU, 16GB)"
-        echo "2) Medium (~50 agents)     - n2-standard-16 (16 vCPU, 64GB)"
-        echo "3) Large  (100s of agents) - n2-standard-32 (32 vCPU, 128GB)"
-        echo "4) XLarge (~1000 agents)   - n2-standard-128 (128 vCPU, 512GB)"
-        read -p "Select [1-4]: " SIZE_CHOICE
-    fi
+    if [[ -z "${MACHINE_TYPE:-}" ]]; then
+        if [[ -z "${SIZE_CHOICE:-}" ]]; then
+            echo "Choose instance size:"
+            echo "1) Small  (10s of agents)  - e2-standard-4 (4 vCPU, 16GB)"
+            echo "2) Medium (~50 agents)     - n2-standard-16 (16 vCPU, 64GB)"
+            echo "3) Large  (100s of agents) - n2-standard-32 (32 vCPU, 128GB)"
+            echo "4) XLarge (~1000 agents)   - n2-standard-128 (128 vCPU, 512GB)"
+            read -p "Select [1-4]: " SIZE_CHOICE
+        fi
 
-    case $SIZE_CHOICE in
-        1) MACHINE_TYPE="e2-standard-4" ;;
-        2) MACHINE_TYPE="n2-standard-16" ;;
-        3) MACHINE_TYPE="n2-standard-32" ;;
-        4) MACHINE_TYPE="n2-standard-128" ;;
-        *) echo "Invalid choice: $SIZE_CHOICE"; exit 1 ;;
-    esac
+        case $SIZE_CHOICE in
+            1) MACHINE_TYPE="e2-standard-4" ;;
+            2) MACHINE_TYPE="n2-standard-16" ;;
+            3) MACHINE_TYPE="n2-standard-32" ;;
+            4) MACHINE_TYPE="n2-standard-128" ;;
+            *) echo "Invalid choice: $SIZE_CHOICE"; exit 1 ;;
+        esac
+    fi
 
     echo "Selected Machine Type: ${MACHINE_TYPE}"
 fi
@@ -137,6 +139,7 @@ fi
 if ! gcloud iam service-accounts describe "${SERVICE_ACCOUNT_EMAIL}" &>/dev/null; then
     echo "Creating service account ${SERVICE_ACCOUNT_NAME}..."
     gcloud iam service-accounts create "${SERVICE_ACCOUNT_NAME}" \
+        --project="${PROJECT_ID}" \
         --display-name "Scion Demo Service Account"
     
     echo "Waiting for service account to propagate..."

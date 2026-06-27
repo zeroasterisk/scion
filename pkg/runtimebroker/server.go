@@ -32,9 +32,11 @@ import (
 	"time"
 
 	"github.com/GoogleCloudPlatform/scion/pkg/agent"
+	"github.com/GoogleCloudPlatform/scion/pkg/api"
 	"github.com/GoogleCloudPlatform/scion/pkg/brokercredentials"
 	"github.com/GoogleCloudPlatform/scion/pkg/config"
 	"github.com/GoogleCloudPlatform/scion/pkg/hubclient"
+	"github.com/GoogleCloudPlatform/scion/pkg/projectcompat"
 	scionrt "github.com/GoogleCloudPlatform/scion/pkg/runtime"
 	"github.com/GoogleCloudPlatform/scion/pkg/storage"
 	"github.com/GoogleCloudPlatform/scion/pkg/templatecache"
@@ -144,6 +146,12 @@ type ServerConfig struct {
 	// container-script dispatches on this broker.
 	AllowContainerScriptHarnesses bool
 
+	// NFSConfig holds NFS workspace storage settings for this broker.
+	// When non-nil with shares configured, the broker can provision and
+	// clean up NFS-backed workspace subtrees. Used by deleteProject (N1-6)
+	// to also remove the NFS project subtree on project deletion.
+	NFSConfig *config.V1NFSConfig
+
 	// ColocatedStorage is the storage backend of a Hub running co-located in the
 	// same process. When set and backed by the local filesystem, the broker
 	// resolves resources for the co-located connection by reading directly from
@@ -192,6 +200,10 @@ type Server struct {
 	// accounting or collide on identical-content hashes.
 	hcCache *templatecache.Cache
 
+	// Shared skill cache (content-addressed). Independent from templates and
+	// harness-configs so skill eviction doesn't affect other resource kinds.
+	skCache *templatecache.Cache
+
 	// Multi-key auth middleware
 	brokerAuthMiddleware *MultiKeyBrokerAuthMiddleware
 
@@ -218,6 +230,15 @@ type Server struct {
 	// manager can't find an agent.
 	auxiliaryRuntimes   map[string]auxiliaryRuntime
 	auxiliaryRuntimesMu sync.RWMutex
+
+	// projectProvisionMu serializes worktree provisioning per project on this
+	// node. Without this, concurrent agent creations for the same project could
+	// race inside ProvisionShared (double-clone / corrupt .git state).
+	// Key: ProjectID (or ProjectPath if ID is empty).
+	projectProvisionMu sync.Map
+
+	// NFS mount reconciler (nil when backend != "nfs")
+	nfsMountReconciler *NFSMountReconciler
 
 	// Dedicated request logger (nil = disabled)
 	requestLogger *slog.Logger
@@ -309,6 +330,17 @@ func New(cfg ServerConfig, mgr agent.Manager, rt scionrt.Runtime) *Server {
 		}
 	}
 
+	// Initialize NFS mount reconciler when NFS storage is configured.
+	// This only constructs the reconciler; Reconcile() is called in Start().
+	if cfg.NFSConfig != nil && len(cfg.NFSConfig.Shares) > 0 {
+		nfsLog := logging.Subsystem("broker.nfs-mount")
+		checker := NewExecMountChecker(nfsLog)
+		srv.nfsMountReconciler = NewNFSMountReconciler(cfg.NFSConfig, checker, nfsLog)
+		slog.Info("NFS mount reconciler initialized",
+			"shares", len(cfg.NFSConfig.Shares),
+			"mountRoot", cfg.NFSConfig.MountRoot)
+	}
+
 	// Initialize Hub integration if enabled
 	if cfg.HubEnabled && (cfg.HubEndpoint != "" || cfg.InMemoryCredentials != nil) {
 		if err := srv.initHubIntegration(); err != nil {
@@ -353,6 +385,16 @@ func (s *Server) initHubIntegration() error {
 		return fmt.Errorf("failed to initialize harness-config cache: %w", err)
 	}
 	s.hcCache = hcCache
+
+	// 1c. Initialize the skill cache for broker-side caching of resolved
+	// skill content, keyed by content hash.
+	skCacheDir := filepath.Join(filepath.Dir(cacheDir), "skills")
+	skCacheMaxSize := int64(500 * 1024 * 1024) // 500MB default
+	skCache, err := templatecache.New(skCacheDir, skCacheMaxSize)
+	if err != nil {
+		return fmt.Errorf("failed to initialize skill cache: %w", err)
+	}
+	s.skCache = skCache
 
 	// 2. Initialize hub connections map (already done in New)
 
@@ -812,6 +854,20 @@ func (s *Server) Start(ctx context.Context) error {
 	// a broker restart.
 	s.discoverAuxiliaryRuntimes()
 
+	// Reconcile NFS mounts at startup (ensure configured shares are mounted).
+	if s.nfsMountReconciler != nil {
+		if err := s.nfsMountReconciler.Reconcile(); err != nil {
+			slog.Warn("NFS mount reconciliation returned error at startup", "error", err)
+		}
+		if !s.nfsMountReconciler.IsHealthy() {
+			slog.Error("NFS mounts unhealthy at startup",
+				"detail", s.nfsMountReconciler.HealthCheckString())
+		} else {
+			slog.Info("NFS mounts reconciled at startup",
+				"status", s.nfsMountReconciler.HealthCheckString())
+		}
+	}
+
 	// Start all hub connections' services
 	s.hubMu.RLock()
 	for name, conn := range s.hubConnections {
@@ -975,14 +1031,11 @@ func (s *Server) LookupContainerID(ctx context.Context, slug, projectID string) 
 	slug = strings.ToLower(slug)
 
 	filter := map[string]string{"scion.name": slug}
-	if projectID != "" {
-		filter["scion.grove_id"] = projectID
-	}
-
 	agents, err := s.manager.List(ctx, filter)
 	if err != nil {
 		return "", fmt.Errorf("failed to list agents: %w", err)
 	}
+	agents = agentsForProject(agents, projectID)
 
 	// Fall back to auxiliary runtimes (e.g. kubernetes when default is docker)
 	if len(agents) == 0 {
@@ -995,6 +1048,9 @@ func (s *Server) LookupContainerID(ctx context.Context, slug, projectID string) 
 
 		for rtName, aux := range auxRuntimes {
 			auxAgents, auxErr := aux.Manager.List(ctx, filter)
+			if auxErr == nil {
+				auxAgents = agentsForProject(auxAgents, projectID)
+			}
 			if auxErr == nil && len(auxAgents) > 0 {
 				agents = auxAgents
 				slog.Debug("Agent found via auxiliary runtime", "slug", slug, "runtime", rtName)
@@ -1064,15 +1120,13 @@ func (s *Server) LookupAgent(ctx context.Context, slug, projectID string) (*Agen
 
 	slug = strings.ToLower(slug)
 	filter := map[string]string{"scion.name": slug}
-	if projectID != "" {
-		filter["scion.grove_id"] = projectID
-	}
 
 	// Try default manager first
 	agents, err := s.manager.List(ctx, filter)
 	if err != nil {
 		return nil, fmt.Errorf("failed to list agents: %w", err)
 	}
+	agents = agentsForProject(agents, projectID)
 
 	runtimeName := s.runtime.Name()
 	var matchedRuntime scionrt.Runtime
@@ -1088,6 +1142,9 @@ func (s *Server) LookupAgent(ctx context.Context, slug, projectID string) (*Agen
 
 		for rtName, aux := range auxRuntimes {
 			auxAgents, auxErr := aux.Manager.List(ctx, filter)
+			if auxErr == nil {
+				auxAgents = agentsForProject(auxAgents, projectID)
+			}
 			if auxErr == nil && len(auxAgents) > 0 {
 				agents = auxAgents
 				runtimeName = rtName
@@ -1176,6 +1233,19 @@ func (s *Server) LookupAgent(ctx context.Context, slug, projectID string) (*Agen
 	}
 
 	return result, nil
+}
+
+func agentsForProject(agents []api.AgentInfo, projectID string) []api.AgentInfo {
+	if projectID == "" {
+		return agents
+	}
+	filtered := make([]api.AgentInfo, 0, len(agents))
+	for _, agent := range agents {
+		if projectcompat.ProjectIDFromLabels(agent.Labels) == projectID {
+			filtered = append(filtered, agent)
+		}
+	}
+	return filtered
 }
 
 // RuntimeCommand implements AgentLookup interface.

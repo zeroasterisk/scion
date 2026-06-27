@@ -23,6 +23,7 @@ import (
 	"time"
 
 	"github.com/GoogleCloudPlatform/scion/pkg/api"
+	"github.com/GoogleCloudPlatform/scion/pkg/projectcompat"
 	"github.com/knadh/koanf/parsers/yaml"
 	"github.com/knadh/koanf/providers/confmap"
 	"github.com/knadh/koanf/providers/env"
@@ -187,15 +188,36 @@ func RequireImageRegistry(projectPath, profileName string) error {
 		"     Example:           scion config set --global image_registry ghcr.io/myorg")
 }
 
-// RewriteImageRegistry replaces the registry prefix of a container image reference
-// with newRegistry. Only images whose basename starts with "scion-" are rewritten.
+// RewriteImageRegistry rewrites an image reference to use newRegistry.
+//
+// Detection uses the Docker/OCI convention: if the part before the first "/"
+// contains a "." or ":" it is treated as a registry domain and the image is
+// considered fully qualified — it is returned unchanged.
+//
+// Bare names (e.g. "scion-claude:latest", "my-agent:v2") and relative paths
+// (e.g. "library/scion-claude:latest") are rewritten so that the basename
+// (last path component) is placed under newRegistry.
+//
 // If newRegistry is empty, the original image is returned unchanged.
 func RewriteImageRegistry(fullImage, newRegistry string) string {
 	if newRegistry == "" || fullImage == "" {
 		return fullImage
 	}
 
-	// Extract the basename (last path component, e.g. "scion-claude:latest")
+	// Check whether the image reference is fully qualified (has a registry domain).
+	// Per Docker/OCI convention, the first path component is a domain if it
+	// contains a "." (e.g. "ghcr.io", "us-docker.pkg.dev") or a ":"
+	// (e.g. "localhost:5000").
+	if firstSlash := strings.Index(fullImage, "/"); firstSlash >= 0 {
+		firstComponent := fullImage[:firstSlash]
+		if strings.ContainsAny(firstComponent, ".:") {
+			// Fully qualified image — keep as-is.
+			return fullImage
+		}
+	}
+
+	// Bare name or relative path — rewrite to newRegistry.
+	// Extract the basename (last path component, e.g. "scion-claude:latest").
 	lastSlash := strings.LastIndex(fullImage, "/")
 	var basename string
 	if lastSlash >= 0 {
@@ -204,12 +226,6 @@ func RewriteImageRegistry(fullImage, newRegistry string) string {
 		basename = fullImage
 	}
 
-	// Only rewrite images following the scion naming convention
-	if !strings.HasPrefix(basename, "scion-") {
-		return fullImage
-	}
-
-	// Strip trailing slash from registry
 	registry := strings.TrimRight(newRegistry, "/")
 	return registry + "/" + basename
 }
@@ -252,17 +268,18 @@ type V1ServerConfig struct {
 	// Mode selects the server operating mode: "workstation" (default) or "hosted".
 	// When set to "hosted", the server behaves as if --hosted were passed.
 	// The legacy value "production" is also accepted for backward compatibility.
-	Mode      string             `json:"mode,omitempty" yaml:"mode,omitempty" koanf:"mode"`
-	Env       string             `json:"env,omitempty" yaml:"env,omitempty" koanf:"env"`
-	Hub       *V1ServerHubConfig `json:"hub,omitempty" yaml:"hub,omitempty" koanf:"hub"`
-	Broker    *V1BrokerConfig    `json:"broker,omitempty" yaml:"broker,omitempty" koanf:"broker"`
-	Database  *V1DatabaseConfig  `json:"database,omitempty" yaml:"database,omitempty" koanf:"database"`
-	Auth      *V1AuthConfig      `json:"auth,omitempty" yaml:"auth,omitempty" koanf:"auth"`
-	OAuth     *V1OAuthConfig     `json:"oauth,omitempty" yaml:"oauth,omitempty" koanf:"oauth"`
-	Storage   *V1StorageConfig   `json:"storage,omitempty" yaml:"storage,omitempty" koanf:"storage"`
-	Secrets   *V1SecretsConfig   `json:"secrets,omitempty" yaml:"secrets,omitempty" koanf:"secrets"`
-	LogLevel  string             `json:"log_level,omitempty" yaml:"log_level,omitempty" koanf:"log_level"`
-	LogFormat string             `json:"log_format,omitempty" yaml:"log_format,omitempty" koanf:"log_format"`
+	Mode             string                    `json:"mode,omitempty" yaml:"mode,omitempty" koanf:"mode"`
+	Env              string                    `json:"env,omitempty" yaml:"env,omitempty" koanf:"env"`
+	Hub              *V1ServerHubConfig        `json:"hub,omitempty" yaml:"hub,omitempty" koanf:"hub"`
+	Broker           *V1BrokerConfig           `json:"broker,omitempty" yaml:"broker,omitempty" koanf:"broker"`
+	Database         *V1DatabaseConfig         `json:"database,omitempty" yaml:"database,omitempty" koanf:"database"`
+	Auth             *V1AuthConfig             `json:"auth,omitempty" yaml:"auth,omitempty" koanf:"auth"`
+	OAuth            *V1OAuthConfig            `json:"oauth,omitempty" yaml:"oauth,omitempty" koanf:"oauth"`
+	Storage          *V1StorageConfig          `json:"storage,omitempty" yaml:"storage,omitempty" koanf:"storage"`
+	WorkspaceStorage *V1WorkspaceStorageConfig `json:"workspace_storage,omitempty" yaml:"workspace_storage,omitempty" koanf:"workspace_storage"`
+	Secrets          *V1SecretsConfig          `json:"secrets,omitempty" yaml:"secrets,omitempty" koanf:"secrets"`
+	LogLevel         string                    `json:"log_level,omitempty" yaml:"log_level,omitempty" koanf:"log_level"`
+	LogFormat        string                    `json:"log_format,omitempty" yaml:"log_format,omitempty" koanf:"log_format"`
 
 	// NotificationChannels configures external notification delivery channels.
 	// Secrets (webhook URLs, API tokens) are held in memory only — never persisted to a database.
@@ -329,9 +346,14 @@ type V1PluginEntry struct {
 	// SelfManaged indicates the plugin manages its own process lifecycle.
 	// The Hub connects to the plugin's RPC server rather than starting it.
 	SelfManaged bool `json:"self_managed,omitempty" yaml:"self_managed,omitempty" koanf:"self_managed"`
-	// Address is the RPC address for self-managed plugins (e.g. "localhost:9090").
-	// Required when SelfManaged is true.
+	// Address is the network address for self-managed or gRPC plugins.
+	// Required when SelfManaged is true or Mode is "grpc".
 	Address string `json:"address,omitempty" yaml:"address,omitempty" koanf:"address"`
+	// Mode selects the plugin communication mode: "" or "plugin" (default go-plugin
+	// subprocess), "grpc" (standalone gRPC broker), "self-managed" (go-plugin RPC to
+	// an externally-managed process). When empty, falls back to SelfManaged for
+	// backward compatibility.
+	Mode string `json:"mode,omitempty" yaml:"mode,omitempty" koanf:"mode"`
 }
 
 // V1ServerHubConfig holds the Hub API server settings (when running scion-server).
@@ -349,6 +371,8 @@ type V1ServerHubConfig struct {
 	SoftDeleteRetention string `json:"soft_delete_retention,omitempty" yaml:"soft_delete_retention,omitempty" koanf:"soft_delete_retention"`
 	// SoftDeleteRetainFiles controls whether workspace files are preserved during soft-delete.
 	SoftDeleteRetainFiles *bool `json:"soft_delete_retain_files,omitempty" yaml:"soft_delete_retain_files,omitempty" koanf:"soft_delete_retain_files"`
+	// AutoSuspendStalled controls whether stalled agents are automatically suspended.
+	AutoSuspendStalled *bool `json:"auto_suspend_stalled,omitempty" yaml:"auto_suspend_stalled,omitempty" koanf:"auto_suspend_stalled"`
 }
 
 // V1BrokerConfig holds Runtime Broker configuration.
@@ -375,17 +399,59 @@ type V1BrokerConfig struct {
 
 // V1DatabaseConfig holds database settings.
 type V1DatabaseConfig struct {
-	Driver string `json:"driver,omitempty" yaml:"driver,omitempty" koanf:"driver"`
-	URL    string `json:"url,omitempty" yaml:"url,omitempty" koanf:"url"`
+	Driver          string `json:"driver,omitempty" yaml:"driver,omitempty" koanf:"driver"`
+	URL             string `json:"url,omitempty" yaml:"url,omitempty" koanf:"url"`
+	MaxOpenConns    int    `json:"max_open_conns,omitempty" yaml:"max_open_conns,omitempty" koanf:"max_open_conns"`
+	MaxIdleConns    int    `json:"max_idle_conns,omitempty" yaml:"max_idle_conns,omitempty" koanf:"max_idle_conns"`
+	ConnMaxLifetime string `json:"conn_max_lifetime,omitempty" yaml:"conn_max_lifetime,omitempty" koanf:"conn_max_lifetime"`
+	ConnMaxIdleTime string `json:"conn_max_idle_time,omitempty" yaml:"conn_max_idle_time,omitempty" koanf:"conn_max_idle_time"`
 }
 
-// V1AuthConfig holds development authentication settings.
+// V1AuthConfig holds authentication settings.
 type V1AuthConfig struct {
-	DevMode           bool     `json:"dev_mode,omitempty" yaml:"dev_mode,omitempty" koanf:"dev_mode"`
-	DevToken          string   `json:"dev_token,omitempty" yaml:"dev_token,omitempty" koanf:"dev_token"`
-	DevTokenFile      string   `json:"dev_token_file,omitempty" yaml:"dev_token_file,omitempty" koanf:"dev_token_file"`
-	AuthorizedDomains []string `json:"authorized_domains,omitempty" yaml:"authorized_domains,omitempty" koanf:"authorized_domains"`
-	UserAccessMode    string   `json:"user_access_mode,omitempty" yaml:"user_access_mode,omitempty" koanf:"user_access_mode"`
+	// Mode selects the exclusive human auth mode: "oauth" (default), "proxy", or "dev".
+	// In proxy mode, OAuth handlers are disabled; in dev mode, dev token auth is used.
+	Mode              string             `json:"mode,omitempty" yaml:"mode,omitempty" koanf:"mode"`
+	DevMode           bool               `json:"dev_mode,omitempty" yaml:"dev_mode,omitempty" koanf:"dev_mode"`
+	DevToken          string             `json:"dev_token,omitempty" yaml:"dev_token,omitempty" koanf:"dev_token"`
+	DevTokenFile      string             `json:"dev_token_file,omitempty" yaml:"dev_token_file,omitempty" koanf:"dev_token_file"`
+	AuthorizedDomains []string           `json:"authorized_domains,omitempty" yaml:"authorized_domains,omitempty" koanf:"authorized_domains"`
+	UserAccessMode    string             `json:"user_access_mode,omitempty" yaml:"user_access_mode,omitempty" koanf:"user_access_mode"`
+	Proxy             *V1ProxyConfig     `json:"proxy,omitempty" yaml:"proxy,omitempty" koanf:"proxy"`
+	Transport         *V1TransportConfig `json:"transport,omitempty" yaml:"transport,omitempty" koanf:"transport"`
+	Username          string             `json:"username,omitempty" yaml:"username,omitempty" koanf:"username"`
+	DisplayName       string             `json:"display_name,omitempty" yaml:"display_name,omitempty" koanf:"display_name"`
+	Email             string             `json:"email,omitempty" yaml:"email,omitempty" koanf:"email"`
+}
+
+// V1TransportConfig holds transport-layer auth settings for agent outbound requests.
+type V1TransportConfig struct {
+	// Mode selects the transport auth mode: "none" (default), "cloudrun_invoker", or "iap".
+	Mode string `json:"mode,omitempty" yaml:"mode,omitempty" koanf:"mode"`
+	// OIDCAudience is the OIDC audience for transport tokens.
+	OIDCAudience string `json:"oidc_audience,omitempty" yaml:"oidc_audience,omitempty" koanf:"oidc_audience"`
+	// PlatformAuthSA is the dedicated SA email used for transport-layer auth.
+	PlatformAuthSA string `json:"platform_auth_sa,omitempty" yaml:"platform_auth_sa,omitempty" koanf:"platform_auth_sa"`
+}
+
+// V1ProxyConfig holds proxy authentication settings (consulted when auth.mode == "proxy").
+type V1ProxyConfig struct {
+	// Provider selects the proxy auth provider: "iap" or "header".
+	Provider string `json:"provider,omitempty" yaml:"provider,omitempty" koanf:"provider"`
+	// IAP holds Google IAP-specific settings.
+	IAP *V1IAPConfig `json:"iap,omitempty" yaml:"iap,omitempty" koanf:"iap"`
+	// RequireTrustedProxyIP enables defense-in-depth IP allowlisting.
+	RequireTrustedProxyIP bool `json:"require_trusted_proxy_ip,omitempty" yaml:"require_trusted_proxy_ip,omitempty" koanf:"require_trusted_proxy_ip"`
+}
+
+// V1IAPConfig holds Google IAP-specific settings.
+type V1IAPConfig struct {
+	// Audience is the expected audience claim — MANDATORY for IAP.
+	Audience string `json:"audience,omitempty" yaml:"audience,omitempty" koanf:"audience"`
+	// Issuer overrides the default IAP issuer (for testing).
+	Issuer string `json:"issuer,omitempty" yaml:"issuer,omitempty" koanf:"issuer"`
+	// JWKSURL overrides the default IAP JWKS URL (for testing).
+	JWKSURL string `json:"jwks_url,omitempty" yaml:"jwks_url,omitempty" koanf:"jwks_url"`
 }
 
 // V1OAuthConfig holds OAuth provider configurations.
@@ -412,6 +478,104 @@ type V1StorageConfig struct {
 	Provider  string `json:"provider,omitempty" yaml:"provider,omitempty" koanf:"provider"`
 	Bucket    string `json:"bucket,omitempty" yaml:"bucket,omitempty" koanf:"bucket"`
 	LocalPath string `json:"local_path,omitempty" yaml:"local_path,omitempty" koanf:"local_path"`
+}
+
+// V1WorkspaceStorageConfig selects the workspace storage backend.
+// Backend defaults to "local" (today's node-local behavior). When set to "nfs",
+// the NFS sub-block configures shared network-attached workspace storage.
+// "cloudrun-volume" and "gke-shared-volume" select vendor-managed volume backends.
+type V1WorkspaceStorageConfig struct {
+	Backend         string                   `json:"backend,omitempty" yaml:"backend,omitempty" koanf:"backend"` // "local" | "nfs" | "cloudrun-volume" | "gke-shared-volume"
+	NFS             *V1NFSConfig             `json:"nfs,omitempty" yaml:"nfs,omitempty" koanf:"nfs"`
+	CloudRunVolume  *V1CloudRunVolumeConfig  `json:"cloudrun_volume,omitempty" yaml:"cloudrun_volume,omitempty" koanf:"cloudrun_volume"`
+	GKESharedVolume *V1GKESharedVolumeConfig `json:"gke_shared_volume,omitempty" yaml:"gke_shared_volume,omitempty" koanf:"gke_shared_volume"`
+}
+
+// V1NFSConfig holds NFS workspace storage settings.
+type V1NFSConfig struct {
+	// MountRoot is the local base under which each share is mounted at <MountRoot>/<share.ID>.
+	MountRoot string `json:"mount_root,omitempty" yaml:"mount_root,omitempty" koanf:"mount_root"`
+	// MountOptions are passed to mount.nfs. Default "vers=3,hard,nconnect=4,_netdev".
+	// NFSv4.1 requires Filestore Enterprise/zonal or self-hosted NFS; basic/HDD
+	// (BASIC_HDD) supports NFSv3 only. We use Postgres advisory locks, not NFS
+	// flock, so v3 is fine for correctness.
+	MountOptions string       `json:"mount_options,omitempty" yaml:"mount_options,omitempty" koanf:"mount_options"`
+	Shares       []V1NFSShare `json:"shares,omitempty" yaml:"shares,omitempty" koanf:"shares"`
+
+	// Stable, node-independent ownership for NFS-backed trees.
+	// Default 1000:1000 to converge with the K8s pod UID/GID.
+	UID int `json:"uid,omitempty" yaml:"uid,omitempty" koanf:"uid"` // default 1000
+	GID int `json:"gid,omitempty" yaml:"gid,omitempty" koanf:"gid"` // default 1000
+
+	// Kubernetes realization
+	StorageClass string `json:"storage_class,omitempty" yaml:"storage_class,omitempty" koanf:"storage_class"`
+	SubPathRoot  string `json:"subpath_root,omitempty" yaml:"subpath_root,omitempty" koanf:"subpath_root"` // default "projects"
+}
+
+// V1NFSShare identifies a single NFS export that may be mounted by a Runtime Broker.
+type V1NFSShare struct {
+	ID     string `json:"id,omitempty" yaml:"id,omitempty" koanf:"id"`                // stable share id → mount dir + (K8s) PV name
+	Server string `json:"server,omitempty" yaml:"server,omitempty" koanf:"server"`    // e.g. 10.0.0.2 or Filestore IP
+	Export string `json:"export,omitempty" yaml:"export,omitempty" koanf:"export"`    // server export path, e.g. /scion-workspaces
+	PVName string `json:"pv_name,omitempty" yaml:"pv_name,omitempty" koanf:"pv_name"` // K8s static PV+subPath strategy
+}
+
+// V1CloudRunVolumeConfig holds Cloud Run managed volume settings.
+// Cloud Run volumes are declared in the service spec and mounted by the
+// platform — no host path or NFS server is needed.
+type V1CloudRunVolumeConfig struct {
+	// VolumeName is the Cloud Run volume resource name declared in the service YAML.
+	VolumeName string `json:"volume_name,omitempty" yaml:"volume_name,omitempty" koanf:"volume_name"`
+	// SubPathRoot is the sub-directory prefix within the volume. Default "projects".
+	SubPathRoot string `json:"subpath_root,omitempty" yaml:"subpath_root,omitempty" koanf:"subpath_root"`
+}
+
+// V1GKESharedVolumeConfig holds GKE-provided shared volume settings
+// (e.g. a Filestore CSI-backed PVC that GKE manages).
+type V1GKESharedVolumeConfig struct {
+	// VolumeName is the K8s volume name referencing the PVC.
+	VolumeName string `json:"volume_name,omitempty" yaml:"volume_name,omitempty" koanf:"volume_name"`
+	// PVClaimName is the PVC name bound to the GKE-managed shared storage.
+	PVClaimName string `json:"pv_claim_name,omitempty" yaml:"pv_claim_name,omitempty" koanf:"pv_claim_name"`
+	// SubPathRoot is the sub-directory prefix within the volume. Default "projects".
+	SubPathRoot string `json:"subpath_root,omitempty" yaml:"subpath_root,omitempty" koanf:"subpath_root"`
+}
+
+// ApplyNFSDefaults fills default values for NFS sub-fields when Backend is "nfs".
+// When Backend is empty or "local", the NFS block is left as-is (no materialization).
+// This is idempotent and safe to call multiple times.
+func (ws *V1WorkspaceStorageConfig) ApplyNFSDefaults() {
+	if ws == nil || strings.ToLower(ws.Backend) != "nfs" {
+		return
+	}
+	if ws.NFS == nil {
+		ws.NFS = &V1NFSConfig{}
+	}
+	if ws.NFS.MountOptions == "" {
+		ws.NFS.MountOptions = "vers=3,hard,nconnect=4,_netdev"
+	}
+	if ws.NFS.UID == 0 {
+		ws.NFS.UID = 1000
+	}
+	if ws.NFS.GID == 0 {
+		ws.NFS.GID = 1000
+	}
+	if ws.NFS.SubPathRoot == "" {
+		ws.NFS.SubPathRoot = "projects"
+	}
+}
+
+// ValidateNFS returns an error if Backend is "nfs" but the NFS block is
+// misconfigured (e.g. no shares defined). Call after ApplyNFSDefaults.
+func (ws *V1WorkspaceStorageConfig) ValidateNFS() error {
+	if ws == nil || strings.ToLower(ws.Backend) != "nfs" {
+		return nil
+	}
+	if ws.NFS == nil || len(ws.NFS.Shares) == 0 {
+		return fmt.Errorf("workspace_storage.backend is \"nfs\" but no NFS shares are defined; " +
+			"add at least one entry under workspace_storage.nfs.shares")
+	}
+	return nil
 }
 
 // V1SecretsConfig holds secrets backend settings.
@@ -522,6 +686,14 @@ type V1TelemetrySamplingConfig struct {
 	Rates   map[string]float64 `json:"rates,omitempty" yaml:"rates,omitempty" koanf:"rates"`
 }
 
+// V1CloudRunConfig holds Cloud Run runtime settings.
+type V1CloudRunConfig struct {
+	// Project is the GCP project ID for Cloud Run API calls.
+	Project string `json:"project,omitempty" yaml:"project,omitempty" koanf:"project"`
+	// Region is the GCP region for Cloud Run services (e.g. "us-central1").
+	Region string `json:"region,omitempty" yaml:"region,omitempty" koanf:"region"`
+}
+
 // V1RuntimeConfig extends RuntimeConfig with a Type field.
 type V1RuntimeConfig struct {
 	Type              string            `json:"type,omitempty" yaml:"type,omitempty" koanf:"type"`
@@ -532,11 +704,14 @@ type V1RuntimeConfig struct {
 	Sync              string            `json:"sync,omitempty" yaml:"sync,omitempty" koanf:"sync"`
 	GKE               bool              `json:"gke,omitempty" yaml:"gke,omitempty" koanf:"gke"`
 	ListAllNamespaces bool              `json:"list_all_namespaces,omitempty" yaml:"list_all_namespaces,omitempty" koanf:"list_all_namespaces"`
+	// CloudRun holds Cloud Run-specific settings when Type is "cloudrun".
+	CloudRun *V1CloudRunConfig `json:"cloudrun,omitempty" yaml:"cloudrun,omitempty" koanf:"cloudrun"`
 }
 
 // HarnessConfigEntry defines a harness configuration entry in versioned settings.
 // The Harness field is required and specifies the harness type this config applies to.
 type HarnessConfigEntry struct {
+	Name             string               `json:"name,omitempty" yaml:"name,omitempty" koanf:"name"`
 	Harness          string               `json:"harness" yaml:"harness" koanf:"harness"`
 	Image            string               `json:"image,omitempty" yaml:"image,omitempty" koanf:"image"`
 	User             string               `json:"user,omitempty" yaml:"user,omitempty" koanf:"user"`
@@ -564,6 +739,7 @@ type HarnessConfigEntry struct {
 	EnvTemplate      map[string]string                `json:"env_template,omitempty" yaml:"env_template,omitempty" koanf:"env_template"`
 	Capabilities     *api.HarnessAdvancedCapabilities `json:"capabilities,omitempty" yaml:"capabilities,omitempty" koanf:"capabilities"`
 	Auth             *HarnessAuthMetadata             `json:"auth,omitempty" yaml:"auth,omitempty" koanf:"auth"`
+	NoAuthConfig     *HarnessNoAuthConfig             `json:"no_auth,omitempty" yaml:"no_auth,omitempty" koanf:"no_auth"`
 	MCP              *HarnessMCPConfig                `json:"mcp,omitempty" yaml:"mcp,omitempty" koanf:"mcp"`
 	Dialect          map[string]interface{}           `json:"dialect,omitempty" yaml:"dialect,omitempty" koanf:"dialect"`
 }
@@ -612,6 +788,11 @@ type HarnessAuthFileRequirement struct {
 	// TargetSuffix is the in-container projection target suffix. Used
 	// together with the broker's home dir resolution, e.g. "/.claude/.credentials.json".
 	TargetSuffix string `json:"target_suffix,omitempty" yaml:"target_suffix,omitempty" koanf:"target_suffix"`
+	// Field maps this file requirement to the corresponding AuthConfig
+	// struct field name (e.g. "ClaudeAuthFile"). Used by
+	// OverlayFileSecretsFromConfig to set auth fields without hardcoded
+	// switch statements.
+	Field string `json:"field,omitempty" yaml:"field,omitempty" koanf:"field"`
 	// AlternativeEnvKeys lists env vars that satisfy this file requirement
 	// in lieu of the file itself (e.g. GOOGLE_APPLICATION_CREDENTIALS for
 	// gcloud-adc).
@@ -634,6 +815,12 @@ type HarnessAuthFileRequirement struct {
 type HarnessAuthAutodetect struct {
 	Env   map[string]string `json:"env,omitempty" yaml:"env,omitempty" koanf:"env"`
 	Files map[string]string `json:"files,omitempty" yaml:"files,omitempty" koanf:"files"`
+}
+
+// HarnessNoAuthConfig defines harness behavior when an agent starts without credentials.
+type HarnessNoAuthConfig struct {
+	Behavior string `json:"behavior,omitempty" yaml:"behavior,omitempty" koanf:"behavior"`
+	Message  string `json:"message,omitempty" yaml:"message,omitempty" koanf:"message"`
 }
 
 // HarnessMCPConfig is the declarative mapping that lets a harness's
@@ -711,8 +898,9 @@ func resolveEffectiveProjectPath(projectPath string) string {
 // Provider priority:
 // 1. Embedded defaults (YAML) with OS-specific runtime adjustment
 // 2. Global settings file (~/.scion/settings.yaml or .json)
-// 3. Project settings file (.scion/settings.yaml or .json)
-// 4. Environment variables (SCION_ prefix)
+// 3. In-repo project settings file (.scion/settings.yaml or .json)
+// 4. External project config settings (for git projects with split storage)
+// 5. Environment variables (SCION_ prefix)
 func LoadVersionedSettings(projectPath string) (*VersionedSettings, error) {
 	k := koanf.New(".")
 
@@ -729,9 +917,17 @@ func LoadVersionedSettings(projectPath string) (*VersionedSettings, error) {
 		}
 	}
 
-	// 3. Load project settings
+	// 3. Load in-repo project settings (.scion/settings.yaml)
 	effectiveProjectPath := resolveEffectiveProjectPath(projectPath)
-	if effectiveProjectPath != "" && effectiveProjectPath != globalDir {
+	if projectPath != "" && projectPath != globalDir {
+		if err := loadSettingsFile(k, projectPath); err != nil {
+			return nil, err
+		}
+		warnIfInRepoHasGlobalKeys(projectPath, effectiveProjectPath)
+	}
+
+	// 4. Load external project config settings (overrides in-repo for split storage)
+	if effectiveProjectPath != "" && effectiveProjectPath != globalDir && effectiveProjectPath != projectPath {
 		if err := loadSettingsFile(k, effectiveProjectPath); err != nil {
 			return nil, err
 		}
@@ -748,7 +944,7 @@ func LoadVersionedSettings(projectPath string) (*VersionedSettings, error) {
 		if projectPath != globalDir {
 			if projectID, err := ReadProjectID(projectPath); err == nil && projectID != "" {
 				_ = k.Load(confmap.Provider(map[string]interface{}{
-					"hub.grove_id": projectID,
+					projectcompat.ConfigHubGroveIDKey: projectID,
 				}, "."), nil)
 			}
 		}
@@ -756,9 +952,9 @@ func LoadVersionedSettings(projectPath string) (*VersionedSettings, error) {
 
 	// Remap hub.project_id to hub.grove_id for backward compatibility with V1 structs.
 	// SCION_HUB_PROJECT_ID maps to hub.project_id via versionedEnvKeyMapper.
-	if k.Exists("hub.project_id") && !k.Exists("hub.grove_id") {
+	if k.Exists(projectcompat.ConfigHubProjectIDKey) && !k.Exists(projectcompat.ConfigHubGroveIDKey) {
 		_ = k.Load(confmap.Provider(map[string]interface{}{
-			"hub.grove_id": k.String("hub.project_id"),
+			projectcompat.ConfigHubGroveIDKey: k.String(projectcompat.ConfigHubProjectIDKey),
 		}, "."), nil)
 	}
 
@@ -779,6 +975,9 @@ func LoadVersionedSettings(projectPath string) (*VersionedSettings, error) {
 // versionedEnvKeyMapper maps SCION_* environment variables to versioned settings keys.
 // All keys are snake_case so no camelCase conversion is needed.
 func versionedEnvKeyMapper(s string) string {
+	if mapped, ok := projectcompat.EnvProjectIDConfigKey(s, false); ok {
+		return mapped
+	}
 	key := strings.ToLower(strings.TrimPrefix(s, "SCION_"))
 
 	// Handle nested hub keys (single level: hub.endpoint, hub.grove_id, etc.)
@@ -811,9 +1010,13 @@ func versionedEnvKeyMapper(s string) string {
 // These must be recognized as single fields rather than split into nested keys.
 // IMPORTANT: Sorted longest-first so that "dev_token_file" matches before "dev_token".
 var knownCompoundFields = []string{
+	"require_trusted_proxy_ip",
 	"soft_delete_retain_files",
 	"soft_delete_retention",
 	"authorized_domains",
+	"platform_auth_sa",
+	"oidc_audience",
+	"jwks_url",
 	"broker_nickname",
 	"allowed_origins",
 	"allowed_methods",
@@ -906,7 +1109,7 @@ func mapEnvKeyRecursive(key string) string {
 func isSectionName(name string) bool {
 	switch name {
 	case "hub", "broker", "database", "auth", "oauth", "storage", "secrets", "cors",
-		"web", "cli", "device", "google", "github":
+		"web", "cli", "device", "google", "github", "proxy", "iap", "transport":
 		return true
 	}
 	return false
@@ -1074,6 +1277,9 @@ func ConvertV1ServerToGlobalConfig(v1 *V1ServerConfig) *GlobalConfig {
 		if v1.Hub.SoftDeleteRetainFiles != nil {
 			gc.Hub.SoftDeleteRetainFiles = *v1.Hub.SoftDeleteRetainFiles
 		}
+		if v1.Hub.AutoSuspendStalled != nil {
+			gc.Hub.AutoSuspendStalled = *v1.Hub.AutoSuspendStalled
+		}
 	}
 
 	// Broker config
@@ -1140,10 +1346,25 @@ func ConvertV1ServerToGlobalConfig(v1 *V1ServerConfig) *GlobalConfig {
 		if v1.Database.URL != "" {
 			gc.Database.URL = v1.Database.URL
 		}
+		if v1.Database.MaxOpenConns != 0 {
+			gc.Database.MaxOpenConns = v1.Database.MaxOpenConns
+		}
+		if v1.Database.MaxIdleConns != 0 {
+			gc.Database.MaxIdleConns = v1.Database.MaxIdleConns
+		}
+		if v1.Database.ConnMaxLifetime != "" {
+			gc.Database.ConnMaxLifetime = v1.Database.ConnMaxLifetime
+		}
+		if v1.Database.ConnMaxIdleTime != "" {
+			gc.Database.ConnMaxIdleTime = v1.Database.ConnMaxIdleTime
+		}
 	}
 
 	// Auth config
 	if v1.Auth != nil {
+		if v1.Auth.Mode != "" {
+			gc.Auth.Mode = v1.Auth.Mode
+		}
 		gc.Auth.Enabled = v1.Auth.DevMode
 		gc.Auth.Token = v1.Auth.DevToken
 		gc.Auth.TokenFile = v1.Auth.DevTokenFile
@@ -1152,6 +1373,35 @@ func ConvertV1ServerToGlobalConfig(v1 *V1ServerConfig) *GlobalConfig {
 		}
 		if v1.Auth.UserAccessMode != "" {
 			gc.Auth.UserAccessMode = v1.Auth.UserAccessMode
+		}
+		if v1.Auth.Proxy != nil {
+			gc.Auth.Proxy = &ProxyAuthConfig{
+				Provider:              v1.Auth.Proxy.Provider,
+				RequireTrustedProxyIP: v1.Auth.Proxy.RequireTrustedProxyIP,
+			}
+			if v1.Auth.Proxy.IAP != nil {
+				gc.Auth.Proxy.IAP = &IAPAuthConfig{
+					Audience: v1.Auth.Proxy.IAP.Audience,
+					Issuer:   v1.Auth.Proxy.IAP.Issuer,
+					JWKSURL:  v1.Auth.Proxy.IAP.JWKSURL,
+				}
+			}
+		}
+		if v1.Auth.Transport != nil {
+			gc.Auth.Transport = &TransportAuthConfig{
+				Mode:           v1.Auth.Transport.Mode,
+				OIDCAudience:   v1.Auth.Transport.OIDCAudience,
+				PlatformAuthSA: v1.Auth.Transport.PlatformAuthSA,
+			}
+		}
+		if v1.Auth.Username != "" {
+			gc.Auth.Username = v1.Auth.Username
+		}
+		if v1.Auth.DisplayName != "" {
+			gc.Auth.DisplayName = v1.Auth.DisplayName
+		}
+		if v1.Auth.Email != "" {
+			gc.Auth.Email = v1.Auth.Email
 		}
 	}
 
@@ -1213,6 +1463,11 @@ func ConvertV1ServerToGlobalConfig(v1 *V1ServerConfig) *GlobalConfig {
 		if v1.Secrets.GCPCredentials != "" {
 			gc.Secrets.GCPCredentials = v1.Secrets.GCPCredentials
 		}
+	}
+
+	// Workspace storage NFS defaults (conditional on backend=nfs)
+	if v1.WorkspaceStorage != nil {
+		v1.WorkspaceStorage.ApplyNFSDefaults()
 	}
 
 	// GitHub App
@@ -1291,17 +1546,45 @@ func ConvertGlobalToV1ServerConfig(gc *GlobalConfig) *V1ServerConfig {
 
 	// Database config
 	v1.Database = &V1DatabaseConfig{
-		Driver: gc.Database.Driver,
-		URL:    gc.Database.URL,
+		Driver:          gc.Database.Driver,
+		URL:             gc.Database.URL,
+		MaxOpenConns:    gc.Database.MaxOpenConns,
+		MaxIdleConns:    gc.Database.MaxIdleConns,
+		ConnMaxLifetime: gc.Database.ConnMaxLifetime,
+		ConnMaxIdleTime: gc.Database.ConnMaxIdleTime,
 	}
 
 	// Auth config
 	v1.Auth = &V1AuthConfig{
+		Mode:              gc.Auth.Mode,
 		DevMode:           gc.Auth.Enabled,
 		DevToken:          gc.Auth.Token,
 		DevTokenFile:      gc.Auth.TokenFile,
 		AuthorizedDomains: gc.Auth.AuthorizedDomains,
 		UserAccessMode:    gc.Auth.UserAccessMode,
+		Username:          gc.Auth.Username,
+		DisplayName:       gc.Auth.DisplayName,
+		Email:             gc.Auth.Email,
+	}
+	if gc.Auth.Proxy != nil {
+		v1.Auth.Proxy = &V1ProxyConfig{
+			Provider:              gc.Auth.Proxy.Provider,
+			RequireTrustedProxyIP: gc.Auth.Proxy.RequireTrustedProxyIP,
+		}
+		if gc.Auth.Proxy.IAP != nil {
+			v1.Auth.Proxy.IAP = &V1IAPConfig{
+				Audience: gc.Auth.Proxy.IAP.Audience,
+				Issuer:   gc.Auth.Proxy.IAP.Issuer,
+				JWKSURL:  gc.Auth.Proxy.IAP.JWKSURL,
+			}
+		}
+	}
+	if gc.Auth.Transport != nil {
+		v1.Auth.Transport = &V1TransportConfig{
+			Mode:           gc.Auth.Transport.Mode,
+			OIDCAudience:   gc.Auth.Transport.OIDCAudience,
+			PlatformAuthSA: gc.Auth.Transport.PlatformAuthSA,
+		}
 	}
 
 	// OAuth config
@@ -1686,6 +1969,14 @@ func UpdateVersionedSetting(dir string, key string, value string) error {
 		return err
 	}
 
+	if projectcompat.IsProjectIDConfigKey(key) || projectcompat.IsHubProjectIDConfigKey(key) {
+		if vs.Hub == nil {
+			vs.Hub = &V1HubClientConfig{}
+		}
+		vs.Hub.ProjectID = value
+		return SaveVersionedSettings(dir, vs)
+	}
+
 	switch key {
 	// --- Direct mappings (same in both formats) ---
 	case "active_profile":
@@ -1705,13 +1996,6 @@ func UpdateVersionedSetting(dir string, key string, value string) error {
 		autohelp := value == "true"
 		vs.CLI.AutoHelp = &autohelp
 
-	// --- grove_id: top-level in legacy, hub.grove_id in v1 ---
-	case "project_id", "grove_id":
-		if vs.Hub == nil {
-			vs.Hub = &V1HubClientConfig{}
-		}
-		vs.Hub.ProjectID = value
-
 	// --- Hub client settings ---
 	case "hub.enabled":
 		if vs.Hub == nil {
@@ -1730,11 +2014,6 @@ func UpdateVersionedSetting(dir string, key string, value string) error {
 			vs.Hub = &V1HubClientConfig{}
 		}
 		vs.Hub.Endpoint = value
-	case "hub.project_id", "hub.grove_id", "hub.projectId", "hub.groveId":
-		if vs.Hub == nil {
-			vs.Hub = &V1HubClientConfig{}
-		}
-		vs.Hub.ProjectID = value
 	case "hub.local_only":
 		if vs.Hub == nil {
 			vs.Hub = &V1HubClientConfig{}
@@ -1768,6 +2047,32 @@ func UpdateVersionedSetting(dir string, key string, value string) error {
 		}
 		vs.Server.Broker.BrokerNickname = value
 
+	// --- Server auth identity ---
+	case "server.auth.display_name":
+		if vs.Server == nil {
+			vs.Server = &V1ServerConfig{}
+		}
+		if vs.Server.Auth == nil {
+			vs.Server.Auth = &V1AuthConfig{}
+		}
+		vs.Server.Auth.DisplayName = value
+	case "server.auth.email":
+		if vs.Server == nil {
+			vs.Server = &V1ServerConfig{}
+		}
+		if vs.Server.Auth == nil {
+			vs.Server.Auth = &V1AuthConfig{}
+		}
+		vs.Server.Auth.Email = value
+	case "server.auth.username":
+		if vs.Server == nil {
+			vs.Server = &V1ServerConfig{}
+		}
+		if vs.Server.Auth == nil {
+			vs.Server.Auth = &V1AuthConfig{}
+		}
+		vs.Server.Auth.Username = value
+
 	// --- Deprecated keys: skip silently in v1 ---
 	case "hub.token", "hub.apiKey", "hub.lastSyncedAt":
 		// These fields don't exist in v1 — skip without error
@@ -1792,6 +2097,13 @@ func UpdateVersionedSetting(dir string, key string, value string) error {
 // GetVersionedSettingValue retrieves a specific setting value from a VersionedSettings struct.
 // It mirrors the keys supported by UpdateVersionedSetting for read access.
 func GetVersionedSettingValue(vs *VersionedSettings, key string) (string, error) {
+	if projectcompat.IsProjectIDConfigKey(key) || projectcompat.IsHubProjectIDConfigKey(key) {
+		if vs.Hub != nil {
+			return vs.Hub.ProjectID, nil
+		}
+		return "", nil
+	}
+
 	switch key {
 	case "active_profile":
 		return vs.ActiveProfile, nil
@@ -1809,11 +2121,6 @@ func GetVersionedSettingValue(vs *VersionedSettings, key string) (string, error)
 				return "true", nil
 			}
 			return "false", nil
-		}
-		return "", nil
-	case "project_id", "grove_id":
-		if vs.Hub != nil {
-			return vs.Hub.ProjectID, nil
 		}
 		return "", nil
 	case "hub.enabled":
@@ -1835,11 +2142,6 @@ func GetVersionedSettingValue(vs *VersionedSettings, key string) (string, error)
 	case "hub.endpoint":
 		if vs.Hub != nil {
 			return vs.Hub.Endpoint, nil
-		}
-		return "", nil
-	case "hub.project_id", "hub.grove_id", "hub.projectId", "hub.groveId":
-		if vs.Hub != nil {
-			return vs.Hub.ProjectID, nil
 		}
 		return "", nil
 	case "hub.local_only":

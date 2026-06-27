@@ -117,6 +117,24 @@ func TestLoadHarnessConfigDir_InvalidUnknownField(t *testing.T) {
 	}
 }
 
+func TestLoadHarnessConfigDir_RejectsPathTraversalName(t *testing.T) {
+	for _, bad := range []string{"../evil", "sub/dir", "etc/passwd", "..", "."} {
+		tmpDir := t.TempDir()
+		configDir := filepath.Join(tmpDir, "legit")
+		if err := os.MkdirAll(configDir, 0755); err != nil {
+			t.Fatal(err)
+		}
+		yaml := "harness: claude\nname: " + bad + "\n"
+		if err := os.WriteFile(filepath.Join(configDir, "config.yaml"), []byte(yaml), 0644); err != nil {
+			t.Fatal(err)
+		}
+		_, err := LoadHarnessConfigDir(configDir)
+		if err == nil {
+			t.Errorf("expected error for name %q, got nil", bad)
+		}
+	}
+}
+
 func TestLoadHarnessConfigDir_NotFound(t *testing.T) {
 	_, err := LoadHarnessConfigDir("/nonexistent/path")
 	if err == nil {
@@ -414,6 +432,63 @@ func TestSeedHarnessConfig_MockHarness(t *testing.T) {
 	}
 }
 
+func TestSeedHarnessConfig_AdditiveOnly(t *testing.T) {
+	tmpDir := t.TempDir()
+	hcBase := filepath.Join(tmpDir, "harness-configs")
+
+	// Pre-create a legacy "opencode" harness-config dir with custom content.
+	opencodeDir := filepath.Join(hcBase, "opencode")
+	if err := os.MkdirAll(filepath.Join(opencodeDir, "home", ".config", "opencode"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	customConfig := "harness: opencode\nimage: my-custom-opencode:v2\nuser: scion\nprovisioner:\n  type: container-script\n  interface_version: 1\n"
+	if err := os.WriteFile(filepath.Join(opencodeDir, "config.yaml"), []byte(customConfig), 0644); err != nil {
+		t.Fatal(err)
+	}
+	customSettings := `{"custom": true}`
+	settingsPath := filepath.Join(opencodeDir, "home", ".config", "opencode", "opencode.json")
+	if err := os.WriteFile(settingsPath, []byte(customSettings), 0644); err != nil {
+		t.Fatal(err)
+	}
+	customProvision := "#!/usr/bin/env python3\n# custom provisioner"
+	if err := os.WriteFile(filepath.Join(opencodeDir, "provision.py"), []byte(customProvision), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Seed only the default set (claude, gemini) — simulates what InitMachine does.
+	for _, h := range GetMockHarnesses() {
+		if err := SeedHarnessConfig(filepath.Join(hcBase, h.Name()), h, false); err != nil {
+			t.Fatalf("SeedHarnessConfig(%s) failed: %v", h.Name(), err)
+		}
+	}
+
+	// Verify the opencode directory and all its custom content survive.
+	if _, err := os.Stat(opencodeDir); err != nil {
+		t.Fatal("opencode harness-config dir should still exist after seeding defaults")
+	}
+	data, err := os.ReadFile(filepath.Join(opencodeDir, "config.yaml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != customConfig {
+		t.Errorf("opencode config.yaml was modified; got:\n%s", data)
+	}
+	data, err = os.ReadFile(settingsPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != customSettings {
+		t.Errorf("opencode opencode.json was modified; got: %s", data)
+	}
+	data, err = os.ReadFile(filepath.Join(opencodeDir, "provision.py"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != customProvision {
+		t.Errorf("opencode provision.py was modified; got: %s", data)
+	}
+}
+
 func TestSeedHarnessConfigFromFS(t *testing.T) {
 	tmpDir := t.TempDir()
 
@@ -432,6 +507,51 @@ func TestSeedHarnessConfigFromFS(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(targetDir, "home", ".test-config")); err != nil {
 		t.Error("expected config directory to be created")
+	}
+}
+
+func TestComputeHarnessConfigRevision_SkipsNonRuntimeFiles(t *testing.T) {
+	dir := t.TempDir()
+
+	if err := os.WriteFile(filepath.Join(dir, "config.yaml"), []byte("harness: opencode\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(dir, "home", ".config"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "home", ".config", "settings.json"), []byte("{}"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	baseRev := ComputeHarnessConfigRevision(dir)
+	if baseRev == "" {
+		t.Fatal("expected non-empty revision")
+	}
+
+	for _, skip := range []string{"cloudbuild.yaml", "README.md", ".gitkeep"} {
+		if err := os.WriteFile(filepath.Join(dir, skip), []byte("should be ignored"), 0644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	afterSkipped := ComputeHarnessConfigRevision(dir)
+	if afterSkipped != baseRev {
+		t.Errorf("adding non-runtime files changed revision: %s -> %s", baseRev, afterSkipped)
+	}
+
+	if err := os.WriteFile(filepath.Join(dir, "Dockerfile"), []byte("FROM scratch"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	afterDockerfile := ComputeHarnessConfigRevision(dir)
+	if afterDockerfile == afterSkipped {
+		t.Error("adding Dockerfile should change revision")
+	}
+
+	if err := os.WriteFile(filepath.Join(dir, "config.yaml"), []byte("harness: opencode\nimage: new\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	afterConfig := ComputeHarnessConfigRevision(dir)
+	if afterConfig == baseRev {
+		t.Error("changing config.yaml should change revision")
 	}
 }
 

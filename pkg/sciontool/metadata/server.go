@@ -20,14 +20,19 @@ package metadata
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/GoogleCloudPlatform/scion/pkg/sciontool/log"
@@ -56,6 +61,16 @@ type Config struct {
 	// When "host", iptables interception is skipped to avoid leaking
 	// redirect rules into the host's network namespace.
 	NetworkMode string
+
+	// FetchGCPToken, if set, is called to obtain a GCP access token from the
+	// Hub instead of making a direct HTTP call. This allows the metadata
+	// server to use the hub client's OIDC transport and correct auth headers.
+	// If nil, the server falls back to direct HTTP requests.
+	FetchGCPToken func(ctx context.Context, scopes []string) (*GCPAccessTokenResponse, error)
+
+	// FetchGCPIdentityToken, if set, is called to obtain a GCP identity
+	// token from the Hub. Same motivation as FetchGCPToken.
+	FetchGCPIdentityToken func(ctx context.Context, audience string) (string, error)
 }
 
 const (
@@ -105,7 +120,7 @@ type Server struct {
 
 	// Token cache
 	mu          sync.RWMutex
-	cachedToken *cachedAccessToken
+	cachedToken *GCPAccessTokenResponse
 	// Identity token cache (keyed by audience)
 	idTokenMu      sync.RWMutex
 	cachedIDTokens map[string]*cachedIDToken
@@ -130,6 +145,9 @@ type Server struct {
 	healthMu     sync.Mutex
 	restartCount int
 	abandoned    bool
+
+	shutdownToken     string
+	shutdownTokenPath string
 }
 
 // authToken returns the current auth token, preferring the dynamic TokenFunc
@@ -141,7 +159,8 @@ func (s *Server) authToken() string {
 	return s.config.AuthToken
 }
 
-type cachedAccessToken struct {
+// GCPAccessTokenResponse is the response from a GCP access token fetch.
+type GCPAccessTokenResponse struct {
 	AccessToken string    `json:"access_token"`
 	ExpiresIn   int       `json:"expires_in"`
 	TokenType   string    `json:"token_type"`
@@ -153,6 +172,14 @@ type cachedIDToken struct {
 	FetchedAt time.Time
 	ExpiresAt time.Time
 }
+
+// activeServer tracks the most recently started Server in this process so that
+// a new Start() call can forcefully close a stale listener without relying on
+// an HTTP endpoint (which may not exist on older binaries).
+var (
+	activeServerMu sync.Mutex
+	activeServer   *Server
+)
 
 // New creates a new metadata server.
 func New(cfg Config) *Server {
@@ -167,25 +194,69 @@ func (s *Server) buildMux() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", s.handleRoot)
 	mux.HandleFunc("/computeMetadata/v1/", s.handleMetadata)
+	mux.HandleFunc("/_scion/shutdown", s.handleShutdown)
 	return s.requireMetadataFlavor(mux)
 }
 
 // Start starts the metadata server in the background. Returns immediately.
+// If the port is already in use (e.g. a stale metadata server from a previous
+// init cycle), Start attempts to gracefully shut it down and retry.
 func (s *Server) Start(ctx context.Context) error {
 	ctx, cancel := context.WithCancel(ctx)
 	s.cancel = cancel
 
 	addr := fmt.Sprintf("127.0.0.1:%d", s.config.Port)
+
+	ln, err := net.Listen("tcp", addr)
+	if err != nil && errors.Is(err, syscall.EADDRINUSE) {
+		log.Info("Metadata server port %d already in use, attempting to reclaim", s.config.Port)
+
+		// Primary: forcefully close a stale server in this process via the
+		// package-level reference. This is reliable regardless of which
+		// binary version started the old server.
+		activeServerMu.Lock()
+		prev := activeServer
+		activeServerMu.Unlock()
+		if prev != nil && prev.srv != nil {
+			log.Info("Forcefully closing previous metadata server instance")
+			prev.srv.Close()
+		} else {
+			// Fallback: try the HTTP shutdown endpoint (cross-process or
+			// the package-level reference was lost).
+			s.shutdownExisting()
+		}
+
+		for attempt := 1; attempt <= 3; attempt++ {
+			time.Sleep(time.Duration(attempt) * 250 * time.Millisecond)
+			ln, err = net.Listen("tcp", addr)
+			if err == nil {
+				log.Info("Reclaimed metadata server port %d after %d retries", s.config.Port, attempt)
+				break
+			}
+			if !errors.Is(err, syscall.EADDRINUSE) {
+				break
+			}
+		}
+	}
+	if err != nil {
+		cancel()
+		return fmt.Errorf("metadata server listen: %w", err)
+	}
+
+	if err := s.ensureShutdownToken(); err != nil {
+		cancel()
+		ln.Close()
+		return fmt.Errorf("metadata server shutdown token: %w", err)
+	}
 	s.srv = &http.Server{
 		Addr:    addr,
 		Handler: s.buildMux(),
 	}
 
-	ln, err := net.Listen("tcp", addr)
-	if err != nil {
-		cancel()
-		return fmt.Errorf("metadata server listen: %w", err)
-	}
+	// Track this server so a future Start() can forcefully close it.
+	activeServerMu.Lock()
+	activeServer = s
+	activeServerMu.Unlock()
 
 	go func() {
 		log.Info("Metadata server started on %s (mode=%s)", addr, s.config.Mode)
@@ -274,11 +345,113 @@ func (s *Server) configureMetadataInterception(uid int) {
 	s.metadataBlocked = method
 }
 
-// Stop gracefully shuts down the server.
+// Stop gracefully shuts down the server. It closes the listener synchronously
+// so the port is released before Stop returns. The background goroutine handles
+// iptables cleanup separately.
 func (s *Server) Stop() {
+	activeServerMu.Lock()
+	if activeServer == s {
+		activeServer = nil
+	}
+	activeServerMu.Unlock()
+
+	// Close the listener and drain connections immediately so the port is
+	// released before the caller proceeds. The context-cancellation goroutine
+	// still runs for iptables cleanup; http.Server.Shutdown is safe to call
+	// more than once.
+	if s.srv != nil {
+		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 2*time.Second)
+		s.srv.Shutdown(shutdownCtx)
+		shutdownCancel()
+	}
+	if s.shutdownTokenPath != "" {
+		if err := os.Remove(s.shutdownTokenPath); err != nil && !errors.Is(err, os.ErrNotExist) {
+			log.Debug("Failed to remove metadata shutdown token file %s: %v", s.shutdownTokenPath, err)
+		}
+	}
+
 	if s.cancel != nil {
 		s.cancel()
 	}
+}
+
+// shutdownExisting tries to shut down an existing metadata server on the port
+// by sending a POST to its /_scion/shutdown endpoint. This handles the case
+// where a stale server from a previous init cycle holds the port.
+func (s *Server) shutdownExisting() {
+	client := &http.Client{Timeout: 2 * time.Second}
+	url := fmt.Sprintf("http://127.0.0.1:%d/_scion/shutdown", s.config.Port)
+	req, err := http.NewRequest(http.MethodPost, url, nil)
+	if err != nil {
+		return
+	}
+	req.Header.Set("Metadata-Flavor", "Google")
+	token, err := os.ReadFile(shutdownTokenPath(s.config.Port))
+	if err != nil {
+		log.Debug("Could not read metadata shutdown token for port %d: %v", s.config.Port, err)
+		return
+	}
+	req.Header.Set("X-Scion-Shutdown-Token", strings.TrimSpace(string(token)))
+	resp, err := client.Do(req)
+	if err != nil {
+		log.Debug("Could not reach existing metadata server for shutdown: %v", err)
+		return
+	}
+	resp.Body.Close()
+	log.Info("Sent shutdown request to existing metadata server on port %d (status=%d)", s.config.Port, resp.StatusCode)
+}
+
+// handleShutdown handles POST /_scion/shutdown requests, allowing a new
+// metadata server instance to reclaim the port from a stale server.
+func (s *Server) handleShutdown(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if s.shutdownToken == "" || r.Header.Get("X-Scion-Shutdown-Token") != s.shutdownToken {
+		http.Error(w, "Forbidden", http.StatusForbidden)
+		return
+	}
+	log.Info("Shutdown requested via /_scion/shutdown, stopping metadata server")
+	w.WriteHeader(http.StatusOK)
+	fmt.Fprint(w, "shutting down")
+	go func() {
+		time.Sleep(50 * time.Millisecond)
+		s.Stop()
+	}()
+}
+
+func shutdownTokenPath(port int) string {
+	return filepath.Join(os.TempDir(), fmt.Sprintf("scion-metadata-shutdown-%d.token", port))
+}
+
+func (s *Server) ensureShutdownToken() error {
+	if s.shutdownToken != "" {
+		return nil
+	}
+	tokenBytes := make([]byte, 32)
+	if _, err := rand.Read(tokenBytes); err != nil {
+		return err
+	}
+	s.shutdownToken = hex.EncodeToString(tokenBytes)
+	s.shutdownTokenPath = shutdownTokenPath(s.config.Port)
+	return writeShutdownToken(s.shutdownTokenPath, s.shutdownToken)
+}
+
+func writeShutdownToken(path, token string) error {
+	if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL|syscall.O_NOFOLLOW, 0600)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	if _, err := f.WriteString(token + "\n"); err != nil {
+		_ = os.Remove(path)
+		return err
+	}
+	return nil
 }
 
 func (s *Server) probeHealth() bool {
@@ -656,7 +829,30 @@ func (s *Server) handleIdentityToken(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprint(w, token.Token)
 }
 
-func (s *Server) fetchAccessToken(ctx context.Context) (*cachedAccessToken, error) {
+func (s *Server) fetchAccessToken(ctx context.Context) (*GCPAccessTokenResponse, error) {
+	var token *GCPAccessTokenResponse
+	var err error
+
+	if s.config.FetchGCPToken != nil {
+		token, err = s.config.FetchGCPToken(ctx, []string{"https://www.googleapis.com/auth/cloud-platform"})
+	} else {
+		token, err = s.fetchAccessTokenDirect(ctx)
+	}
+
+	if err != nil {
+		return nil, err
+	}
+
+	token.FetchedAt = time.Now()
+
+	s.mu.Lock()
+	s.cachedToken = token
+	s.mu.Unlock()
+
+	return token, nil
+}
+
+func (s *Server) fetchAccessTokenDirect(ctx context.Context) (*GCPAccessTokenResponse, error) {
 	endpoint := fmt.Sprintf("%s/api/v1/agent/gcp-token", strings.TrimSuffix(s.config.HubURL, "/"))
 
 	body, _ := json.Marshal(map[string][]string{
@@ -682,16 +878,10 @@ func (s *Server) fetchAccessToken(ctx context.Context) (*cachedAccessToken, erro
 		return nil, fmt.Errorf("hub returned %d: %s", resp.StatusCode, string(respBody))
 	}
 
-	var token cachedAccessToken
+	var token GCPAccessTokenResponse
 	if err := json.Unmarshal(respBody, &token); err != nil {
 		return nil, fmt.Errorf("parse response: %w", err)
 	}
-	token.FetchedAt = time.Now()
-
-	// Cache
-	s.mu.Lock()
-	s.cachedToken = &token
-	s.mu.Unlock()
 
 	return &token, nil
 }
@@ -701,38 +891,23 @@ type hubIDTokenResponse struct {
 }
 
 func (s *Server) fetchIdentityToken(ctx context.Context, audience string) (*cachedIDToken, error) {
-	endpoint := fmt.Sprintf("%s/api/v1/agent/gcp-identity-token", strings.TrimSuffix(s.config.HubURL, "/"))
+	var tokenStr string
+	var err error
 
-	body, _ := json.Marshal(map[string]string{"audience": audience})
+	if s.config.FetchGCPIdentityToken != nil {
+		tokenStr, err = s.config.FetchGCPIdentityToken(ctx, audience)
+	} else {
+		tokenStr, err = s.fetchIdentityTokenDirect(ctx, audience)
+	}
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
 	if err != nil {
-		return nil, fmt.Errorf("create request: %w", err)
-	}
-
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", "Bearer "+s.authToken())
-
-	resp, err := s.client.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("hub request: %w", err)
-	}
-	defer resp.Body.Close()
-
-	respBody, _ := io.ReadAll(resp.Body)
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("hub returned %d: %s", resp.StatusCode, string(respBody))
-	}
-
-	var result hubIDTokenResponse
-	if err := json.Unmarshal(respBody, &result); err != nil {
-		return nil, fmt.Errorf("parse response: %w", err)
+		return nil, err
 	}
 
 	cached := &cachedIDToken{
-		Token:     result.Token,
+		Token:     tokenStr,
 		FetchedAt: time.Now(),
-		ExpiresAt: time.Now().Add(55 * time.Minute), // Conservative: ID tokens are ~1hr
+		ExpiresAt: time.Now().Add(55 * time.Minute),
 	}
 
 	s.idTokenMu.Lock()
@@ -740,6 +915,38 @@ func (s *Server) fetchIdentityToken(ctx context.Context, audience string) (*cach
 	s.idTokenMu.Unlock()
 
 	return cached, nil
+}
+
+func (s *Server) fetchIdentityTokenDirect(ctx context.Context, audience string) (string, error) {
+	endpoint := fmt.Sprintf("%s/api/v1/agent/gcp-identity-token", strings.TrimSuffix(s.config.HubURL, "/"))
+
+	body, _ := json.Marshal(map[string]string{"audience": audience})
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
+	if err != nil {
+		return "", fmt.Errorf("create request: %w", err)
+	}
+
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+s.authToken())
+
+	resp, err := s.client.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("hub request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	respBody, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("hub returned %d: %s", resp.StatusCode, string(respBody))
+	}
+
+	var result hubIDTokenResponse
+	if err := json.Unmarshal(respBody, &result); err != nil {
+		return "", fmt.Errorf("parse response: %w", err)
+	}
+
+	return result.Token, nil
 }
 
 func (s *Server) proactiveRefreshLoop(ctx context.Context) {

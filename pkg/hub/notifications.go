@@ -33,7 +33,7 @@ import (
 // messages to subscriber agents.
 type NotificationDispatcher struct {
 	store           store.Store
-	events          *ChannelEventPublisher
+	events          EventPublisher
 	getDispatcher   func() AgentDispatcher // lazy getter; dispatcher may be set after startup
 	log             *slog.Logger
 	messageLog      *slog.Logger        // dedicated message audit logger (nil = disabled)
@@ -48,7 +48,7 @@ type NotificationDispatcher struct {
 // The getDispatcher function is called at dispatch time to resolve the current
 // AgentDispatcher, allowing the dispatcher to be set up after the notification
 // system starts (e.g. in combined hub+web mode).
-func NewNotificationDispatcher(s store.Store, events *ChannelEventPublisher, getDispatcher func() AgentDispatcher, log *slog.Logger) *NotificationDispatcher {
+func NewNotificationDispatcher(s store.Store, events EventPublisher, getDispatcher func() AgentDispatcher, log *slog.Logger) *NotificationDispatcher {
 	return &NotificationDispatcher{
 		store:         s,
 		events:        events,
@@ -358,7 +358,10 @@ func (nd *NotificationDispatcher) dispatchToAgent(ctx context.Context, sub *stor
 	structuredMsg.RecipientID = subscriber.ID
 	structuredMsg.Status = strings.ToUpper(notif.Status)
 
-	if err := dispatcher.DispatchAgentMessage(ctx, subscriber, notif.Message, false, structuredMsg); err != nil {
+	retryCtx, retryCancel := context.WithTimeout(ctx, 30*time.Second)
+	defer retryCancel()
+
+	if err := dispatchWithBrokerRetry(retryCtx, dispatcher, subscriber, notif.Message, false, structuredMsg); err != nil {
 		nd.log.Error("Failed to dispatch notification to agent",
 			"subscriberID", sub.SubscriberID, "error", err)
 	} else {
@@ -514,6 +517,12 @@ func formatNotificationMessage(agent *store.Agent, status string) string {
 		return msg
 	case "DELETED":
 		return fmt.Sprintf("%s has been DELETED", agent.Slug)
+	case "DELIVERY_FAILED":
+		msg := fmt.Sprintf("Message delivery to %s failed", agent.Slug)
+		if agent.Message != "" {
+			msg += ": " + agent.Message
+		}
+		return msg
 	default:
 		return fmt.Sprintf("%s has reached status: %s", agent.Slug, upper)
 	}

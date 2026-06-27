@@ -20,6 +20,7 @@ import (
 	"strings"
 
 	"github.com/GoogleCloudPlatform/scion/pkg/api"
+	"github.com/GoogleCloudPlatform/scion/pkg/config"
 	"github.com/GoogleCloudPlatform/scion/pkg/storage"
 	"github.com/GoogleCloudPlatform/scion/pkg/store"
 )
@@ -236,6 +237,10 @@ func (s *Server) handleHarnessConfigByID(w http.ResponseWriter, r *http.Request)
 		s.handleHarnessConfigFinalize(w, r, hcID)
 	case "download":
 		s.handleHarnessConfigDownload(w, r, hcID)
+	case "clone":
+		s.handleHarnessConfigClone(w, r, hcID)
+	case "reimport":
+		s.handleHarnessConfigReimport(w, r, hcID)
 	case "files":
 		s.handleHarnessConfigFiles(w, r, hcID, "")
 	default:
@@ -289,11 +294,6 @@ func (s *Server) updateHarnessConfig(w http.ResponseWriter, r *http.Request, id 
 		return
 	}
 
-	if existing.Locked {
-		ValidationError(w, "harness config is locked and cannot be modified", nil)
-		return
-	}
-
 	var hc store.HarnessConfig
 	if err := readJSON(r, &hc); err != nil {
 		BadRequest(w, "Invalid request body: "+err.Error())
@@ -304,8 +304,6 @@ func (s *Server) updateHarnessConfig(w http.ResponseWriter, r *http.Request, id 
 	hc.ID = existing.ID
 	hc.Created = existing.Created
 	hc.CreatedBy = existing.CreatedBy
-	hc.Locked = existing.Locked
-
 	if hc.Slug == "" {
 		hc.Slug = api.Slugify(hc.Name)
 	}
@@ -324,11 +322,6 @@ func (s *Server) patchHarnessConfig(w http.ResponseWriter, r *http.Request, id s
 	existing, err := s.store.GetHarnessConfig(ctx, id)
 	if err != nil {
 		writeErrorFromErr(w, err, "")
-		return
-	}
-
-	if existing.Locked {
-		ValidationError(w, "harness config is locked and cannot be modified", nil)
 		return
 	}
 
@@ -377,7 +370,6 @@ func (s *Server) deleteHarnessConfig(w http.ResponseWriter, r *http.Request, id 
 	query := r.URL.Query()
 
 	deleteFiles := query.Get("deleteFiles") == "true"
-	force := query.Get("force") == "true"
 
 	existing, err := s.store.GetHarnessConfig(ctx, id)
 	if err != nil {
@@ -385,8 +377,55 @@ func (s *Server) deleteHarnessConfig(w http.ResponseWriter, r *http.Request, id 
 		return
 	}
 
-	if existing.Locked && !force {
-		ValidationError(w, "harness config is locked; use force=true to delete", nil)
+	// Authorize: check source scope for ActionDelete
+	switch existing.Scope {
+	case store.HarnessConfigScopeGlobal:
+		userIdent := GetUserIdentityFromContext(ctx)
+		if userIdent == nil {
+			writeError(w, http.StatusUnauthorized, "unauthorized", "Authentication required", nil)
+			return
+		}
+		decision := s.authzService.CheckAccess(ctx, userIdent, Resource{Type: "harness_config"}, ActionDelete)
+		if !decision.Allowed {
+			writeError(w, http.StatusForbidden, ErrCodeForbidden, "You do not have permission to delete global resources", nil)
+			return
+		}
+	case store.HarnessConfigScopeProject:
+		if agentIdent := GetAgentIdentityFromContext(ctx); agentIdent != nil {
+			if !agentIdent.HasScope(ScopeAgentCreate) {
+				writeError(w, http.StatusForbidden, ErrCodeForbidden, "Missing required scope", nil)
+				return
+			}
+			if existing.ScopeID != agentIdent.ProjectID() {
+				writeError(w, http.StatusForbidden, ErrCodeForbidden, "Agents can only manage resources within their own project", nil)
+				return
+			}
+		} else if userIdent := GetUserIdentityFromContext(ctx); userIdent != nil {
+			decision := s.authzService.CheckAccess(ctx, userIdent, Resource{
+				Type: "harness_config", ParentType: "project", ParentID: existing.ScopeID,
+			}, ActionDelete)
+			if !decision.Allowed {
+				writeError(w, http.StatusForbidden, ErrCodeForbidden, "You do not have permission to delete resources in this project", nil)
+				return
+			}
+		} else {
+			writeError(w, http.StatusUnauthorized, "unauthorized", "Authentication required", nil)
+			return
+		}
+	case store.HarnessConfigScopeUser:
+		userIdent := GetUserIdentityFromContext(ctx)
+		if userIdent == nil {
+			writeError(w, http.StatusUnauthorized, "unauthorized", "Authentication required", nil)
+			return
+		}
+		if existing.OwnerID != userIdent.ID() {
+			writeError(w, http.StatusForbidden, ErrCodeForbidden,
+				"You do not have permission to delete another user's harness config", nil)
+			return
+		}
+	default:
+		writeError(w, http.StatusForbidden, ErrCodeForbidden,
+			"Delete is not supported for this resource scope", nil)
 		return
 	}
 
@@ -541,5 +580,242 @@ func (s *Server) handleHarnessConfigDownload(w http.ResponseWriter, r *http.Requ
 		Files:       downloadURLs,
 		ManifestURL: manifestURL,
 		Expires:     expires,
+	})
+}
+
+// handleHarnessConfigClone creates a copy of a harness config.
+func (s *Server) handleHarnessConfigClone(w http.ResponseWriter, r *http.Request, id string) {
+	if r.Method != http.MethodPost {
+		MethodNotAllowed(w)
+		return
+	}
+
+	ctx := r.Context()
+
+	source, err := s.store.GetHarnessConfig(ctx, id)
+	if err != nil {
+		writeErrorFromErr(w, err, "")
+		return
+	}
+
+	var req CloneTemplateRequest
+	if err := readJSON(r, &req); err != nil {
+		BadRequest(w, "Invalid request body: "+err.Error())
+		return
+	}
+
+	if req.Name == "" {
+		ValidationError(w, "name is required", nil)
+		return
+	}
+
+	// Resolve scope ID
+	scopeID := req.ScopeID
+	if scopeID == "" && req.ProjectID != "" {
+		scopeID = req.ProjectID
+	}
+
+	// Authorize: check destination scope for ActionCreate
+	destScope := req.Scope
+	if destScope == "" {
+		destScope = source.Scope
+	}
+	if destScope == "" {
+		destScope = store.HarnessConfigScopeGlobal
+	}
+	switch destScope {
+	case store.HarnessConfigScopeGlobal:
+		userIdent := GetUserIdentityFromContext(ctx)
+		if userIdent == nil {
+			writeError(w, http.StatusUnauthorized, "unauthorized", "Authentication required", nil)
+			return
+		}
+		decision := s.authzService.CheckAccess(ctx, userIdent, Resource{Type: "harness_config"}, ActionCreate)
+		if !decision.Allowed {
+			writeError(w, http.StatusForbidden, ErrCodeForbidden, "You do not have permission to create global resources", nil)
+			return
+		}
+	case store.HarnessConfigScopeProject:
+		if agentIdent := GetAgentIdentityFromContext(ctx); agentIdent != nil {
+			if !agentIdent.HasScope(ScopeAgentCreate) {
+				writeError(w, http.StatusForbidden, ErrCodeForbidden, "Missing required scope", nil)
+				return
+			}
+			if scopeID != agentIdent.ProjectID() {
+				writeError(w, http.StatusForbidden, ErrCodeForbidden, "Agents can only manage resources within their own project", nil)
+				return
+			}
+		} else if userIdent := GetUserIdentityFromContext(ctx); userIdent != nil {
+			decision := s.authzService.CheckAccess(ctx, userIdent, Resource{
+				Type: "harness_config", ParentType: "project", ParentID: scopeID,
+			}, ActionCreate)
+			if !decision.Allowed {
+				writeError(w, http.StatusForbidden, ErrCodeForbidden, "You do not have permission to create resources in this project", nil)
+				return
+			}
+		} else {
+			writeError(w, http.StatusUnauthorized, "unauthorized", "Authentication required", nil)
+			return
+		}
+	}
+
+	clone := &store.HarnessConfig{
+		ID:          api.NewUUID(),
+		Name:        req.Name,
+		Slug:        api.Slugify(req.Name),
+		DisplayName: source.DisplayName,
+		Description: source.Description,
+		Harness:     source.Harness,
+		Config:      source.Config,
+		Scope:       destScope,
+		ScopeID:     scopeID,
+		Visibility:  req.Visibility,
+		Status:      store.HarnessConfigStatusPending,
+	}
+
+	if clone.Visibility == "" {
+		clone.Visibility = source.Visibility
+	}
+
+	storagePath := storage.HarnessConfigStoragePath(clone.Scope, clone.ScopeID, clone.Slug)
+	clone.StoragePath = storagePath
+
+	stor := s.GetStorage()
+	if stor != nil {
+		clone.StorageBucket = stor.Bucket()
+		clone.StorageURI = storage.HarnessConfigStorageURI(stor.Bucket(), clone.Scope, clone.ScopeID, clone.Slug)
+	}
+
+	if stor != nil && len(source.Files) > 0 && source.StoragePath != "" {
+		for _, file := range source.Files {
+			srcPath := source.StoragePath + "/" + file.Path
+			dstPath := storagePath + "/" + file.Path
+			if _, err := stor.Copy(ctx, srcPath, dstPath); err != nil {
+				_ = stor.DeletePrefix(ctx, storagePath)
+				RuntimeError(w, "Failed to copy files: "+err.Error())
+				return
+			}
+		}
+		clone.Files = source.Files
+		clone.ContentHash = source.ContentHash
+		clone.Status = store.HarnessConfigStatusActive
+	}
+
+	if err := s.store.CreateHarnessConfig(ctx, clone); err != nil {
+		if stor != nil {
+			_ = stor.DeletePrefix(ctx, storagePath)
+		}
+		if strings.Contains(err.Error(), "UNIQUE constraint failed") {
+			writeError(w, http.StatusConflict, "conflict", "A resource with this slug already exists in the target scope. Choose a different name.", nil)
+			return
+		}
+		writeErrorFromErr(w, err, "")
+		return
+	}
+
+	writeJSON(w, http.StatusCreated, clone)
+}
+
+// ReimportHarnessConfigRequest is the optional request body for the reimport endpoint.
+type ReimportHarnessConfigRequest struct {
+	SourceURL string `json:"sourceUrl,omitempty"`
+}
+
+// handleHarnessConfigReimport re-imports a harness-config from its stored
+// source_url (or an override URL). POST /api/v1/harness-configs/{id}/reimport
+func (s *Server) handleHarnessConfigReimport(w http.ResponseWriter, r *http.Request, id string) {
+	if r.Method != http.MethodPost {
+		MethodNotAllowed(w)
+		return
+	}
+
+	ctx := r.Context()
+
+	hc, err := s.store.GetHarnessConfig(ctx, id)
+	if err != nil {
+		writeErrorFromErr(w, err, "")
+		return
+	}
+	if hc == nil {
+		NotFound(w, "HarnessConfig")
+		return
+	}
+
+	var req ReimportHarnessConfigRequest
+	if r.Body != nil && r.Body != http.NoBody {
+		if err := readJSON(r, &req); err != nil {
+			BadRequest(w, "Invalid request body: "+err.Error())
+			return
+		}
+	}
+
+	sourceURL := req.SourceURL
+	if sourceURL == "" {
+		sourceURL = hc.SourceURL
+	}
+	if sourceURL == "" {
+		writeError(w, http.StatusBadRequest, "no_source_url",
+			"No source URL stored and none provided. Use the sourceUrl field to specify one.", nil)
+		return
+	}
+
+	sourceURL = config.NormalizeTemplateSourceURL(sourceURL)
+
+	// Authorize: same as import — harness_config:create on the owning scope.
+	switch hc.Scope {
+	case store.HarnessConfigScopeGlobal:
+		userIdent := GetUserIdentityFromContext(ctx)
+		if userIdent == nil {
+			writeError(w, http.StatusUnauthorized, "unauthorized", "Authentication required", nil)
+			return
+		}
+		decision := s.authzService.CheckAccess(ctx, userIdent, Resource{Type: "harness_config"}, ActionCreate)
+		if !decision.Allowed {
+			writeError(w, http.StatusForbidden, ErrCodeForbidden, "You do not have permission to reimport global resources", nil)
+			return
+		}
+	case store.HarnessConfigScopeProject:
+		if !s.authorizeProjectImport(ctx, w, hc.ScopeID, "harness-configs") {
+			return
+		}
+	case store.HarnessConfigScopeUser:
+		userIdent := GetUserIdentityFromContext(ctx)
+		if userIdent == nil {
+			writeError(w, http.StatusUnauthorized, "unauthorized", "Authentication required", nil)
+			return
+		}
+		if hc.OwnerID != userIdent.ID() {
+			writeError(w, http.StatusForbidden, ErrCodeForbidden, "You do not have permission to reimport another user's harness config", nil)
+			return
+		}
+	default:
+		writeError(w, http.StatusForbidden, ErrCodeForbidden, "Reimport is not supported for this resource scope", nil)
+		return
+	}
+
+	if s.GetStorage() == nil {
+		writeError(w, http.StatusServiceUnavailable, "storage_unavailable", "Storage is not configured", nil)
+		return
+	}
+
+	kind := s.harnessConfigImportKind()
+	run := func(progress importProgressFunc) ([]string, error) {
+		return s.importFromRemote(ctx, hc.ScopeID, sourceURL, hc.Scope, kind, progress, nil)
+	}
+
+	if importAcceptsNDJSON(r) {
+		s.streamImport(w, run)
+		return
+	}
+
+	imported, err := run(nil)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "reimport_failed", err.Error(), nil)
+		return
+	}
+
+	writeJSON(w, http.StatusOK, ImportHarnessConfigsResponse{
+		HarnessConfigs: imported,
+		Count:          len(imported),
 	})
 }

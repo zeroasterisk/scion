@@ -249,10 +249,18 @@ type VolumeMount struct {
 	Source   string `json:"source" yaml:"source"`
 	Target   string `json:"target" yaml:"target"`
 	ReadOnly bool   `json:"read_only,omitempty" yaml:"read_only,omitempty"`
-	Type     string `json:"type,omitempty" yaml:"type,omitempty"`     // "local" (default) or "gcs"
-	Bucket   string `json:"bucket,omitempty" yaml:"bucket,omitempty"` // For GCS
-	Prefix   string `json:"prefix,omitempty" yaml:"prefix,omitempty"` // For GCS
-	Mode     string `json:"mode,omitempty" yaml:"mode,omitempty"`     // Mount options
+	// Type discriminates the volume kind:
+	//   "local" (default) — host bind mount; requires Source.
+	//   "gcs"             — GCS FUSE mount; requires Bucket.
+	//   "nfs"             — literal NFS protocol mount; requires Server, Source.
+	//   "cloudrun-volume" — Cloud Run managed volume; requires VolumeName.
+	//   "gke-shared-volume" — GKE-provided shared volume (e.g. Filestore CSI PVC); requires VolumeName.
+	Type       string `json:"type,omitempty" yaml:"type,omitempty"`
+	Bucket     string `json:"bucket,omitempty" yaml:"bucket,omitempty"`           // GCS bucket name
+	Prefix     string `json:"prefix,omitempty" yaml:"prefix,omitempty"`           // GCS object prefix
+	Mode       string `json:"mode,omitempty" yaml:"mode,omitempty"`               // Mount options
+	Server     string `json:"server,omitempty" yaml:"server,omitempty"`           // NFS: server host/IP
+	VolumeName string `json:"volume_name,omitempty" yaml:"volume_name,omitempty"` // Cloud Run / GKE volume name
 }
 
 // Validate checks that a VolumeMount has the required fields and valid values.
@@ -271,8 +279,23 @@ func (v VolumeMount) Validate() error {
 		if v.Bucket == "" {
 			return fmt.Errorf("GCS volume mount for target %q missing required field: bucket", v.Target)
 		}
+	case "nfs":
+		if v.Server == "" {
+			return fmt.Errorf("NFS volume mount for target %q missing required field: server", v.Target)
+		}
+		if v.Source == "" {
+			return fmt.Errorf("NFS volume mount for target %q missing required field: source (server export path)", v.Target)
+		}
+	case "cloudrun-volume":
+		if v.VolumeName == "" {
+			return fmt.Errorf("cloudrun-volume mount for target %q missing required field: volume_name", v.Target)
+		}
+	case "gke-shared-volume":
+		if v.VolumeName == "" {
+			return fmt.Errorf("gke-shared-volume mount for target %q missing required field: volume_name", v.Target)
+		}
 	default:
-		return fmt.Errorf("volume mount for target %q has invalid type %q (must be \"local\" or \"gcs\")", v.Target, v.Type)
+		return fmt.Errorf("volume mount for target %q has invalid type %q (must be \"local\", \"gcs\", \"nfs\", \"cloudrun-volume\", or \"gke-shared-volume\")", v.Target, v.Type)
 	}
 
 	return nil
@@ -437,6 +460,9 @@ type ScionConfig struct {
 	Telemetry     *TelemetryConfig           `json:"telemetry,omitempty" yaml:"telemetry,omitempty"`
 
 	Secrets []RequiredSecret `json:"secrets,omitempty" yaml:"secrets,omitempty"`
+
+	// Skills declares skill references to resolve at provision time.
+	Skills []SkillReference `json:"skills,omitempty" yaml:"skills,omitempty" koanf:"skills"`
 
 	// Agnostic template fields
 	AgentInstructions    string `json:"agent_instructions,omitempty" yaml:"agent_instructions,omitempty"`
@@ -639,6 +665,13 @@ type RequiredSecret struct {
 	// the file secret is not required. For example, GOOGLE_APPLICATION_CREDENTIALS
 	// can substitute for a gcloud-adc file secret.
 	AlternativeEnvKeys []string `json:"alternative_env_keys,omitempty" yaml:"alternative_env_keys,omitempty"`
+}
+
+// SkillReference declares a skill dependency in a template's scion-agent.yaml.
+type SkillReference struct {
+	URI      string `json:"uri" yaml:"uri" koanf:"uri"`
+	As       string `json:"as,omitempty" yaml:"as,omitempty" koanf:"as"`
+	Optional bool   `json:"optional,omitempty" yaml:"optional,omitempty" koanf:"optional"`
 }
 
 // SecretKeyInfo provides metadata about a required secret key, including

@@ -16,15 +16,21 @@ package runtimebroker
 
 import (
 	"context"
+	"log/slog"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 
 	"github.com/GoogleCloudPlatform/scion/pkg/agent"
 	"github.com/GoogleCloudPlatform/scion/pkg/api"
 	"github.com/GoogleCloudPlatform/scion/pkg/config"
+	"github.com/GoogleCloudPlatform/scion/pkg/provision"
+	"github.com/GoogleCloudPlatform/scion/pkg/runtime"
+	"github.com/GoogleCloudPlatform/scion/pkg/store"
 )
 
 // startContext holds all the resolved state needed to start an agent.
@@ -70,7 +76,13 @@ type startContextInputs struct {
 	ResolvedSecrets []api.ResolvedSecret
 
 	// Behavior
+	NoAuth bool
 	Attach bool
+
+	// WorkspaceMode is the resolved workspace sharing mode for the project
+	// (e.g. "worktree-per-agent"). Threaded from CreateAgentRequest so the
+	// broker can branch dispatch without re-deriving from labels.
+	WorkspaceMode string
 
 	// HTTP request (for hub connection resolution)
 	HTTPRequest *http.Request
@@ -207,11 +219,24 @@ func (s *Server) buildStartContext(ctx context.Context, in startContextInputs) (
 		}
 	}
 
-	// 3. Hub auth token
+	// 3. Hub auth token. Precedence (highest first):
+	//   1. in.AgentToken — the explicit hub-provided dedicated field (create path).
+	//   2. an existing env["SCION_AUTH_TOKEN"] already populated from in.ResolvedEnv
+	//      above — on the start/resume path the hub mints the agent JWT into
+	//      resolvedEnv, so it is already present here and must be kept.
+	//   3. the broker's own dev SCION_AUTH_TOKEN — last resort only.
+	// The dev-token fallback must NOT clobber a token resolved from the hub:
+	// resume mints a valid JWT into resolvedEnv, and overwriting it with the
+	// broker's dev token caused 401s ("compact JWS format must have three parts").
 	if in.AgentToken != "" {
 		env["SCION_AUTH_TOKEN"] = in.AgentToken
 		if s.config.Debug {
 			s.agentLifecycleLog.Debug("SCION_AUTH_TOKEN set from agent token", "agent_id", in.AgentID, "length", len(in.AgentToken))
+		}
+	} else if env["SCION_AUTH_TOKEN"] != "" {
+		// Token already resolved from the hub via resolvedEnv (start/resume path); keep it.
+		if s.config.Debug {
+			s.agentLifecycleLog.Debug("SCION_AUTH_TOKEN kept from resolved env", "agent_id", in.AgentID, "length", len(env["SCION_AUTH_TOKEN"]))
 		}
 	} else if devToken := os.Getenv("SCION_AUTH_TOKEN"); devToken != "" {
 		env["SCION_AUTH_TOKEN"] = devToken
@@ -343,6 +368,7 @@ func (s *Server) buildStartContext(ctx context.Context, in startContextInputs) (
 		Name:        in.Name,
 		BrokerMode:  true,
 		ProjectPath: in.ProjectPath,
+		NoAuth:      in.NoAuth,
 	}
 
 	if in.Attach {
@@ -433,8 +459,19 @@ func (s *Server) buildStartContext(ctx context.Context, in startContextInputs) (
 		}
 	}
 
+	// --- Worktree-per-agent mode ---
+	// When the hub sets WorkspaceMode to worktree-per-agent and the project
+	// is git-backed, provision a shared base clone + per-agent worktree on
+	// the host BEFORE the container starts, then dual-mount it. This avoids
+	// the full in-container clone. Falls through to clone-per-agent on error
+	// or if git is too old (< 2.47).
+	worktreeProvisioned := false
+	if in.Config != nil && in.Config.GitClone != nil && in.WorkspaceMode == store.WorkspaceModeWorktreePerAgent {
+		worktreeProvisioned = s.tryProvisionWorktree(ctx, in, &opts, env)
+	}
+
 	// --- Git clone mode ---
-	if in.Config != nil && in.Config.GitClone != nil {
+	if !worktreeProvisioned && in.Config != nil && in.Config.GitClone != nil {
 		gc := in.Config.GitClone
 		env["SCION_GIT_CLONE_URL"] = gc.URL
 		if gc.Branch != "" {
@@ -466,7 +503,9 @@ func (s *Server) buildStartContext(ctx context.Context, in startContextInputs) (
 		opts.TelemetryOverride = &enabled
 	}
 
-	if len(in.ResolvedSecrets) > 0 {
+	if in.NoAuth {
+		opts.ResolvedSecrets = nil
+	} else if len(in.ResolvedSecrets) > 0 {
 		opts.ResolvedSecrets = in.ResolvedSecrets
 		if s.config.Debug {
 			s.envSecretLog.Debug("Received resolved secrets", "count", len(in.ResolvedSecrets))
@@ -494,6 +533,233 @@ type startContextError struct {
 
 func (e *startContextError) Error() string {
 	return e.Message
+}
+
+// tryProvisionWorktree attempts to provision a per-agent worktree on the host
+// for worktree-per-agent mode. On success it sets opts.Workspace to the
+// worktree path and returns true (opts.GitClone is NOT set, suppressing the
+// in-container clone). On failure or if git is too old, it logs a warning and
+// returns false so the caller falls through to clone-per-agent.
+func (s *Server) tryProvisionWorktree(ctx context.Context, in startContextInputs, opts *api.StartOptions, env map[string]string) bool {
+	runtimeName := ""
+	if s.runtime != nil {
+		runtimeName = s.runtime.Name()
+	}
+
+	result := resolveWorktreeProvision(worktreeProvisionInput{
+		WorkspaceMode: in.WorkspaceMode,
+		GitClone:      in.Config.GitClone,
+		ProjectPath:   in.ProjectPath,
+		ProjectID:     in.ProjectID,
+		ProjectSlug:   in.ProjectSlug,
+		AgentID:       in.AgentID,
+		AgentName:     in.Name,
+		Branch:        in.Config.Branch,
+		RuntimeName:   runtimeName,
+	})
+
+	if !result.ShouldProvision {
+		if result.Reason != "" {
+			slog.Warn("worktree-per-agent: falling back to clone-per-agent",
+				"agent_id", in.AgentID, "reason", result.Reason)
+		}
+		return false
+	}
+
+	// Set Ctx from the buildStartContext context.
+	result.ProvisionInput.Ctx = ctx
+
+	// Serialize same-project provisioning on this node to prevent concurrent
+	// ProvisionShared calls from racing on the shared base clone.
+	mu := s.projectProvisionMutex(in.ProjectID, in.ProjectPath)
+	mu.Lock()
+	defer mu.Unlock()
+
+	if err := provision.ProvisionShared(result.ProvisionInput); err != nil {
+		slog.Warn("worktree-per-agent: provisioning failed, falling back to clone-per-agent",
+			"agent_id", in.AgentID, "error", err)
+		// Clean up ONLY this agent's partial worktree — never result.ProjectRoot,
+		// the shared base clone holding the common .git and every other agent's
+		// worktree under worktrees/<agentID>. Removing the base would destroy the
+		// workspaces of all other running agents for this project. A partial base
+		// clone is self-healed by provision.gitCloneWorkspace on retry.
+		//
+		// Use `git worktree remove --force` so the worktree's admin metadata in
+		// the base's .git/worktrees/<id> is unregistered too — a bare os.RemoveAll
+		// would leave a stale registration that makes git refuse to recreate the
+		// worktree at that path on retry. Fall back to os.RemoveAll + prune.
+		if result.WorktreePath != "" && result.ProjectRoot != "" {
+			rm := exec.CommandContext(ctx, "git", "-C", result.ProjectRoot,
+				"worktree", "remove", "--force", result.WorktreePath)
+			if out, rmErr := rm.CombinedOutput(); rmErr != nil {
+				slog.Warn("worktree-per-agent: git worktree remove failed, falling back to os.RemoveAll+prune",
+					"agent_id", in.AgentID, "path", result.WorktreePath,
+					"error", rmErr, "output", strings.TrimSpace(string(out)))
+				if cleanErr := os.RemoveAll(result.WorktreePath); cleanErr != nil {
+					slog.Warn("worktree-per-agent: failed to clean up partial worktree",
+						"agent_id", in.AgentID, "path", result.WorktreePath, "error", cleanErr)
+				}
+				// Prune the now-stale .git/worktrees/<id> registration so retries succeed.
+				_ = exec.CommandContext(ctx, "git", "-C", result.ProjectRoot, "worktree", "prune").Run()
+			} else {
+				slog.Info("worktree-per-agent: cleaned up partial worktree and unregistered from git",
+					"agent_id", in.AgentID, "path", result.WorktreePath)
+			}
+		}
+		return false
+	}
+
+	// Source the authoritative worktree path from the sharer registry.
+	// For a JOIN, the agent shares an existing worktree rather than having
+	// its own at WorktreePath(base, agentID).
+	actualWorkspace := result.WorktreePath
+	branch := result.ProvisionInput.AgentName
+	if branch == "" {
+		branch = in.AgentID
+	}
+	if _, regPath, err := provision.ListSharers(result.ProjectRoot, branch); err == nil && regPath != "" {
+		actualWorkspace = regPath
+	}
+
+	// Write .scion workspace marker so the in-container CLI discovers project context.
+	if in.ProjectID != "" && in.ProjectSlug != "" {
+		if err := config.WriteWorkspaceMarker(actualWorkspace, in.ProjectID, in.ProjectSlug, in.ProjectSlug); err != nil {
+			slog.Warn("worktree-per-agent: failed to write workspace marker (non-fatal)",
+				"path", actualWorkspace, "error", err)
+		}
+	}
+
+	opts.Workspace = actualWorkspace
+	if s.config.Debug {
+		s.agentLifecycleLog.Debug("Worktree-per-agent mode enabled",
+			"agent_id", in.AgentID,
+			"workspace", result.WorktreePath,
+			"project_root", result.ProjectRoot)
+	}
+	return true
+}
+
+// projectProvisionMutex returns the per-project mutex for serializing worktree
+// provisioning. Uses ProjectID as key, falling back to ProjectPath if empty.
+func (s *Server) projectProvisionMutex(projectID, projectPath string) *sync.Mutex {
+	key := projectID
+	if key == "" {
+		key = projectPath
+	}
+	actual, _ := s.projectProvisionMu.LoadOrStore(key, &sync.Mutex{})
+	return actual.(*sync.Mutex)
+}
+
+// worktreeProvisionInput holds the fields needed to decide whether to
+// provision a worktree and to build the ProvisionInput. Factored out
+// for testability (no Server dependency).
+type worktreeProvisionInput struct {
+	WorkspaceMode string
+	GitClone      *api.GitCloneConfig
+	ProjectPath   string
+	ProjectID     string
+	ProjectSlug   string
+	AgentID       string
+	AgentName     string
+	Branch        string
+
+	// RuntimeName is the name of the container runtime ("kubernetes", "docker",
+	// etc.) from runtime.Name(). Used to reject host-side worktree provisioning
+	// on Kubernetes where pods cannot bind-mount host worktrees — worktree-per-agent
+	// on K8s requires the NFS backend (init-container path).
+	RuntimeName string
+
+	// eligibilityOverride, when non-nil, replaces the runtime.WorktreeModeEligible
+	// check. Used in tests to simulate git-too-old without requiring a specific
+	// git binary.
+	eligibilityOverride func() (bool, string)
+}
+
+// worktreeProvisionResult holds the outcome of resolveWorktreeProvision.
+type worktreeProvisionResult struct {
+	ShouldProvision bool
+	Reason          string
+	ProvisionInput  provision.ProvisionInput
+	WorktreePath    string
+	ProjectRoot     string
+}
+
+// resolveWorktreeProvision is the pure decision function: given the dispatch
+// inputs, it determines whether worktree provisioning should proceed and
+// builds the ProvisionInput. It checks the git-version gate and resolves
+// the workspace backend. No side effects — all provisioning happens in the
+// caller.
+func resolveWorktreeProvision(in worktreeProvisionInput) worktreeProvisionResult {
+	if in.WorkspaceMode != store.WorkspaceModeWorktreePerAgent {
+		return worktreeProvisionResult{Reason: "workspace mode is not worktree-per-agent"}
+	}
+	if in.GitClone == nil {
+		return worktreeProvisionResult{Reason: "project is not git-backed"}
+	}
+
+	eligCheck := runtime.WorktreeModeEligible
+	if in.eligibilityOverride != nil {
+		eligCheck = in.eligibilityOverride
+	}
+	eligible, reason := eligCheck()
+	if !eligible {
+		return worktreeProvisionResult{Reason: reason}
+	}
+
+	// On Kubernetes, host-side worktree provisioning does not work: pods
+	// cannot bind-mount a host worktree. Worktree-per-agent on K8s is
+	// supported only via the NFS backend (init-container path in
+	// k8s_runtime.go). When the broker's host-side path is reached for a
+	// K8s runtime, fall back to clone-per-agent.
+	if in.RuntimeName == "kubernetes" {
+		return worktreeProvisionResult{
+			Reason: "worktree-per-agent on Kubernetes requires the NFS backend; " +
+				"node-local host-side provisioning is not supported (pods cannot bind-mount host worktrees)",
+		}
+	}
+
+	mode := store.SharingModeWorktreePerAgent
+	backend := runtime.SelectWorkspaceBackend(nil, mode)
+	resolved, err := backend.Resolve(runtime.ResolveInput{
+		ProjectDir: in.ProjectPath,
+		ProjectID:  in.ProjectID,
+		AgentID:    in.AgentID,
+		Mode:       mode,
+	})
+	if err != nil {
+		return worktreeProvisionResult{Reason: "backend resolve failed: " + err.Error()}
+	}
+
+	agentName := in.AgentName
+	if in.Branch != "" {
+		agentName = in.Branch
+	}
+	if agentName == "" {
+		agentName = in.AgentID
+	}
+
+	worktreePath := provision.WorktreePath(resolved.HostPath, in.AgentID)
+
+	// Copy GitClone config so we don't mutate the shared pointer, and force a
+	// full clone (Depth -1 ≡ no --depth flag). The shared base needs full
+	// history for coordinator merges, git log, and git blame (design §4.2a).
+	gcCopy := *in.GitClone
+	gcCopy.Depth = -1
+
+	return worktreeProvisionResult{
+		ShouldProvision: true,
+		ProvisionInput: provision.ProvisionInput{
+			Resolved:  resolved,
+			Mode:      mode,
+			GitClone:  &gcCopy,
+			ProjectID: in.ProjectID,
+			AgentID:   in.AgentID,
+			AgentName: agentName,
+			Locker:    nil,
+		},
+		WorktreePath: worktreePath,
+		ProjectRoot:  resolved.HostPath,
+	}
 }
 
 // hasWorkspaceContent returns true if dir exists and contains meaningful

@@ -193,6 +193,7 @@ func (h *CommandHandler) handleSetup(msg *TGMessage) {
 
 func (h *CommandHandler) handleDefault(msg *TGMessage) {
 	chatID := msg.Chat.ID
+	threadID := msg.MessageThreadID
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
@@ -222,8 +223,24 @@ func (h *CommandHandler) handleDefault(msg *TGMessage) {
 		return
 	}
 
-	kb := buildDefaultAgentKeyboard(agentSlugs(agents), link.DefaultAgent)
-	h.replyWithKeyboard(chatID, "Select the default agent for @-mentions:", kb)
+	promptText := "Select the default agent for @-mentions:"
+	currentDefault := link.DefaultAgent
+
+	if threadID != 0 {
+		topicDefault, err := h.store.GetTopicDefault(ctx, chatID, threadID)
+		if err != nil {
+			h.log.Error("Failed to get topic default", "error", err)
+		} else if topicDefault != "" {
+			currentDefault = topicDefault
+		}
+		promptText = "Select the default agent for this topic:"
+		if link.DefaultAgent != "" {
+			promptText += fmt.Sprintf("\nChat-wide default: @%s", link.DefaultAgent)
+		}
+	}
+
+	kb := buildDefaultAgentKeyboard(ctx, h.store, agentSlugs(agents), currentDefault, threadID)
+	h.replyWithKeyboardInThread(chatID, threadID, promptText, kb)
 }
 
 func (h *CommandHandler) handleAgents(msg *TGMessage) {
@@ -575,6 +592,18 @@ func (h *CommandHandler) replyWithKeyboard(chatID int64, text string, kb *Inline
 	}
 }
 
+func (h *CommandHandler) replyWithKeyboardInThread(chatID int64, threadID int64, text string, kb *InlineKeyboardMarkup) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	var opts []SendOption
+	if threadID != 0 {
+		opts = append(opts, SendOption{MessageThreadID: threadID})
+	}
+	if _, err := h.api.SendMessageWithKeyboard(ctx, chatID, text, "", kb, 0, opts...); err != nil {
+		h.log.Error("Failed to send reply with keyboard", "chat_id", chatID, "error", err)
+	}
+}
+
 func isGroupChat(chatID int64) bool { return chatID < 0 }
 
 // --- httpHubClient ---
@@ -617,7 +646,7 @@ type hubAgent struct {
 }
 
 func (c *httpHubClient) ListProjects(ctx context.Context) ([]ProjectOption, error) {
-	url := c.hubURL + "/api/v1/groves"
+	url := c.hubURL + "/api/v1/projects"
 
 	slog.Debug("Listing projects from hub", "url", url, "broker_id", c.brokerID)
 
@@ -695,7 +724,7 @@ func (c *httpHubClient) ListProjectsFresh(ctx context.Context) ([]ProjectOption,
 }
 
 func (c *httpHubClient) ListProjectsForUser(ctx context.Context, ownerID string) ([]ProjectOption, error) {
-	url := c.hubURL + "/api/v1/groves?ownerId=" + ownerID
+	url := c.hubURL + "/api/v1/projects?ownerId=" + ownerID
 
 	slog.Debug("Listing projects for user from hub", "url", url, "owner_id", ownerID)
 
@@ -731,7 +760,7 @@ func (c *httpHubClient) ListProjectsForUser(ctx context.Context, ownerID string)
 }
 
 func (c *httpHubClient) ListAgents(ctx context.Context, projectID string) ([]AgentInfo, error) {
-	url := fmt.Sprintf("%s/api/v1/groves/%s/agents", c.hubURL, projectID)
+	url := fmt.Sprintf("%s/api/v1/projects/%s/agents", c.hubURL, projectID)
 	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
 	if err != nil {
 		return nil, fmt.Errorf("create list agents request: %w", err)

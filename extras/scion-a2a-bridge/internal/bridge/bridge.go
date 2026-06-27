@@ -29,11 +29,13 @@ import (
 	"github.com/GoogleCloudPlatform/scion/extras/scion-a2a-bridge/internal/state"
 	"github.com/GoogleCloudPlatform/scion/pkg/hubclient"
 	"github.com/GoogleCloudPlatform/scion/pkg/messages"
+	"github.com/GoogleCloudPlatform/scion/pkg/projectcompat"
 )
 
 var (
 	ErrAgentNotFound  = errors.New("agent not found")
 	ErrContextUnknown = errors.New("unknown context ID")
+	ErrTaskTerminal   = errors.New("task is in a terminal state")
 )
 
 // waiter tracks a blocking response channel with agent routing info.
@@ -232,10 +234,15 @@ func agentKey(projectID, agentSlug string) string {
 	return projectID + ":" + agentSlug
 }
 
-// SendMessage handles an A2A SendMessage. When blocking is true (the default),
-// it waits for the agent response. When blocking is false, it returns immediately
-// after submitting the message and the client can poll via GetTask or subscribe.
-func (b *Bridge) SendMessage(ctx context.Context, projectSlug, agentSlug, contextID string, parts []Part, blocking bool) (*TaskResult, error) {
+// SendMessage handles an A2A SendMessage. When taskID is non-empty, the message
+// is routed as a follow-up to an existing task (continuing the conversation).
+// When blocking is true (the default), it waits for the agent response.
+func (b *Bridge) SendMessage(ctx context.Context, projectSlug, agentSlug, contextID, existingTaskID string, parts []Part, blocking bool) (*TaskResult, error) {
+	// Follow-up on an existing task
+	if existingTaskID != "" {
+		return b.sendFollowUp(ctx, projectSlug, agentSlug, existingTaskID, parts, blocking)
+	}
+
 	agentCtx, err := b.resolveContext(ctx, projectSlug, agentSlug, contextID)
 	if err != nil {
 		return nil, fmt.Errorf("resolve context: %w", err)
@@ -267,12 +274,12 @@ func (b *Bridge) SendMessage(ctx context.Context, projectSlug, agentSlug, contex
 	scionMsg.Metadata = map[string]string{"a2aTaskId": taskID}
 
 	if b.broker != nil {
-		pattern := fmt.Sprintf("scion.project.%s.user.%s.messages", agentCtx.ProjectID, b.config.Hub.User)
+		pattern := projectcompat.UserTopic(agentCtx.ProjectID, b.config.Hub.User)
 		if err := b.broker.RequestSubscription(pattern); err != nil {
 			b.log.Warn("failed to request subscription", "pattern", pattern, "error", err)
 		}
 		// Subscribe to legacy grove topic as well during transition.
-		legacyPattern := fmt.Sprintf("scion.grove.%s.user.%s.messages", agentCtx.ProjectID, b.config.Hub.User)
+		legacyPattern := projectcompat.LegacyUserTopic(agentCtx.ProjectID, b.config.Hub.User)
 		if err := b.broker.RequestSubscription(legacyPattern); err != nil {
 			b.log.Warn("failed to request legacy subscription", "pattern", legacyPattern, "error", err)
 		}
@@ -286,7 +293,7 @@ func (b *Bridge) SendMessage(ctx context.Context, projectSlug, agentSlug, contex
 			defer b.wg.Done()
 			sendCtx, cancel := context.WithTimeout(b.shutdownCtx, 30*time.Second)
 			defer cancel()
-			if err := b.hubClient.Agents().SendStructuredMessage(sendCtx, agentCtx.AgentID, scionMsg, false, false, false); err != nil {
+			if _, err := b.hubClient.Agents().SendStructuredMessage(sendCtx, agentCtx.AgentID, scionMsg, false, false, false); err != nil {
 				b.log.Error("non-blocking send failed", "error", err, "task_id", taskID)
 				if err := b.store.UpdateTaskState(taskID, TaskStateFailed); err != nil {
 					b.log.Error("failed to update task state", "error", err, "task_id", taskID)
@@ -318,12 +325,14 @@ func (b *Bridge) SendMessage(ctx context.Context, projectSlug, agentSlug, contex
 		projectID: agentCtx.ProjectID,
 	})
 	defer b.removeWaiter(taskID)
-	defer b.unregisterActiveTask(taskID, aKey)
+	// Keep task registered in activeTasks — the agent's eventual state-change
+	// to completed/failed will close it via dispatchToActiveTask.
 
-	if err := b.hubClient.Agents().SendStructuredMessage(ctx, agentCtx.AgentID, scionMsg, false, false, false); err != nil {
+	if _, err := b.hubClient.Agents().SendStructuredMessage(ctx, agentCtx.AgentID, scionMsg, false, false, false); err != nil {
 		if err := b.store.UpdateTaskState(taskID, TaskStateFailed); err != nil {
 			b.log.Error("failed to update task state", "error", err, "task_id", taskID)
 		}
+		b.unregisterActiveTask(taskID, aKey)
 		return nil, fmt.Errorf("send message to agent: %w", err)
 	}
 
@@ -342,15 +351,12 @@ func (b *Bridge) SendMessage(ctx context.Context, projectSlug, agentSlug, contex
 	select {
 	case response := <-responseCh:
 		msg, artifacts := TranslateScionToA2A(response)
-		if err := b.store.UpdateTaskState(taskID, TaskStateCompleted); err != nil {
-			b.log.Error("failed to update task state", "error", err, "task_id", taskID)
-		}
 
 		return &TaskResult{
 			ID:        taskID,
 			ContextID: agentCtx.ContextID,
 			Status: TaskStatus{
-				State:   TaskStateCompleted,
+				State:   TaskStateWorking,
 				Message: &msg,
 			},
 			Artifacts: artifacts,
@@ -360,14 +366,123 @@ func (b *Bridge) SendMessage(ctx context.Context, projectSlug, agentSlug, contex
 		if err := b.store.UpdateTaskState(taskID, TaskStateFailed); err != nil {
 			b.log.Error("failed to update task state", "error", err, "task_id", taskID)
 		}
+		b.unregisterActiveTask(taskID, aKey)
 		return nil, fmt.Errorf("timeout waiting for agent response after %v", timeout)
 
 	case <-ctx.Done():
 		if err := b.store.UpdateTaskState(taskID, TaskStateFailed); err != nil {
 			b.log.Error("failed to update task state", "error", err, "task_id", taskID)
 		}
+		b.unregisterActiveTask(taskID, aKey)
 		return nil, ctx.Err()
 	}
+}
+
+// sendFollowUp routes a user message to an existing task's agent, continuing
+// the conversation. Returns ErrTaskTerminal if the task has already completed.
+func (b *Bridge) sendFollowUp(ctx context.Context, projectSlug, agentSlug, taskID string, parts []Part, blocking bool) (*TaskResult, error) {
+	task, err := b.store.GetTask(taskID)
+	if err != nil {
+		return nil, fmt.Errorf("get task: %w", err)
+	}
+	if task == nil {
+		return nil, fmt.Errorf("%w: %s", ErrAgentNotFound, taskID)
+	}
+	if task.ProjectID != projectSlug || task.AgentSlug != agentSlug {
+		return nil, fmt.Errorf("%w: task does not belong to %s/%s", ErrAgentNotFound, projectSlug, agentSlug)
+	}
+	if IsTerminalState(task.State) {
+		return nil, fmt.Errorf("%w: state is %s", ErrTaskTerminal, task.State)
+	}
+
+	agentID := task.AgentID
+	if agent := b.lookupAgent(ctx, task.ProjectID, task.AgentSlug); agent != nil {
+		agentID = agent.ID
+	}
+
+	scionMsg := TranslateA2AToScion(parts)
+	scionMsg.Sender = fmt.Sprintf("user:%s", b.config.Hub.User)
+	scionMsg.Recipient = fmt.Sprintf("agent:%s", task.AgentSlug)
+	scionMsg.Metadata = map[string]string{"a2aTaskId": taskID}
+
+	// Re-request broker subscriptions in case the broker reconnected since
+	// the original task was created (subscriptions may have been lost).
+	if b.broker != nil {
+		pattern := projectcompat.UserTopic(task.ProjectID, b.config.Hub.User)
+		if err := b.broker.RequestSubscription(pattern); err != nil {
+			b.log.Warn("failed to re-request subscription for follow-up", "pattern", pattern, "error", err)
+		}
+		legacyPattern := projectcompat.LegacyUserTopic(task.ProjectID, b.config.Hub.User)
+		if err := b.broker.RequestSubscription(legacyPattern); err != nil {
+			b.log.Warn("failed to re-request legacy subscription for follow-up", "pattern", legacyPattern, "error", err)
+		}
+	}
+
+	if err := b.store.UpdateTaskState(taskID, TaskStateWorking); err != nil {
+		b.log.Error("failed to update task state for follow-up", "error", err, "task_id", taskID)
+	}
+
+	if blocking {
+		aKey := agentKey(task.ProjectID, task.AgentSlug)
+		b.registerActiveTask(taskID, aKey)
+		responseCh := make(chan *messages.StructuredMessage, 1)
+		b.addWaiter(taskID, &waiter{ch: responseCh, agentSlug: task.AgentSlug, projectID: task.ProjectID})
+		defer b.removeWaiter(taskID)
+		defer b.unregisterActiveTask(taskID, aKey)
+
+		if _, err := b.hubClient.Agents().SendStructuredMessage(ctx, agentID, scionMsg, false, false, false); err != nil {
+			b.failFollowUpTask(taskID)
+			return nil, fmt.Errorf("send follow-up to agent: %w", err)
+		}
+
+		timeout := b.config.Timeouts.SendMessage
+		if timeout == 0 {
+			timeout = 120 * time.Second
+		}
+		timer := time.NewTimer(timeout)
+		defer timer.Stop()
+
+		select {
+		case response := <-responseCh:
+			if err := b.store.UpdateTaskState(taskID, TaskStateWorking); err != nil {
+				b.log.Error("failed to update task state", "error", err, "task_id", taskID)
+			}
+			msg, artifacts := TranslateScionToA2A(response)
+			return &TaskResult{
+				ID:        taskID,
+				ContextID: task.ContextID,
+				Status:    TaskStatus{State: TaskStateWorking, Message: &msg},
+				Artifacts: artifacts,
+			}, nil
+		case <-timer.C:
+			b.failFollowUpTask(taskID)
+			return nil, fmt.Errorf("timeout waiting for agent response after %v", timeout)
+		case <-ctx.Done():
+			b.failFollowUpTask(taskID)
+			return nil, ctx.Err()
+		}
+	}
+
+	// Non-blocking follow-up
+	aKey := agentKey(task.ProjectID, task.AgentSlug)
+	b.registerActiveTask(taskID, aKey)
+	b.wg.Add(1)
+	go func() {
+		defer b.wg.Done()
+		sendCtx, cancel := context.WithTimeout(b.shutdownCtx, 30*time.Second)
+		defer cancel()
+		if _, err := b.hubClient.Agents().SendStructuredMessage(sendCtx, agentID, scionMsg, false, false, false); err != nil {
+			b.log.Error("non-blocking follow-up send failed", "error", err, "task_id", taskID)
+			b.failFollowUpTask(taskID)
+			b.unregisterActiveTask(taskID, aKey)
+		}
+	}()
+
+	return &TaskResult{
+		ID:        taskID,
+		ContextID: task.ContextID,
+		Status:    TaskStatus{State: TaskStateWorking},
+	}, nil
 }
 
 // GetTask retrieves a task by ID.
@@ -441,7 +556,7 @@ func (b *Bridge) CancelTask(ctx context.Context, taskID string) (*TaskResult, er
 			Type:      messages.TypeInstruction,
 			Metadata:  map[string]string{"a2aTaskId": taskID},
 		}
-		if err := b.hubClient.Agents().SendStructuredMessage(ctx, targetAgentID, interruptMsg, true, false, false); err != nil {
+		if _, err := b.hubClient.Agents().SendStructuredMessage(ctx, targetAgentID, interruptMsg, true, false, false); err != nil {
 			b.log.Error("failed to send cancel interrupt to agent", "error", err, "task_id", taskID, "agent_id", targetAgentID)
 		}
 	}
@@ -590,6 +705,14 @@ func (b *Bridge) dispatchToWaiter(taskID string, msg *messages.StructuredMessage
 		return false
 	}
 	if msg.Type == messages.TypeStateChange {
+		// Terminal state-changes must still be persisted to the DB even though
+		// we skip the waiter — otherwise the task's stored state is never updated.
+		if taskState := MapActivityToTaskState(msg.Msg); IsTerminalState(taskState) {
+			if err := b.store.UpdateTaskState(taskID, taskState); err != nil {
+				b.log.Error("failed to persist terminal state from waiter path",
+					"task_id", taskID, "state", taskState, "error", err)
+			}
+		}
 		return true
 	}
 	select {
@@ -602,8 +725,6 @@ func (b *Bridge) dispatchToWaiter(taskID string, msg *messages.StructuredMessage
 
 // dispatchToActiveTask routes a broker message to streaming/push subscribers for a task.
 func (b *Bridge) dispatchToActiveTask(ctx context.Context, taskID, agentSlug string, msg *messages.StructuredMessage) {
-	a2aMsg, artifacts := TranslateScionToA2A(msg)
-
 	if msg.Type == messages.TypeStateChange {
 		taskState := MapActivityToTaskState(msg.Msg)
 		if err := b.store.UpdateTaskState(taskID, taskState); err != nil {
@@ -628,51 +749,77 @@ func (b *Bridge) dispatchToActiveTask(ctx context.Context, taskID, agentSlug str
 			aKey := b.activeTasks[taskID].aKey
 			b.tasksMu.RUnlock()
 			b.unregisterActiveTask(taskID, aKey)
+			b.streams.CloseAll(taskID)
 		}
-	} else {
-		// TODO(multi-turn): MVP limitation — treats any non-state-change message as
-		// a terminal response. Multi-turn agents that emit interim content (e.g.
-		// clarifying questions, progress updates) will have their task closed
-		// prematurely on the first content message. This breaks agents that use
-		// input-required → completed flows. Must be fixed before exposing
-		// non-trivial agent types.
-		b.log.Debug("treating content message as task completion (MVP)", "task_id", taskID)
-		if err := b.store.UpdateTaskState(taskID, TaskStateCompleted); err != nil {
-			b.log.Error("failed to update task state", "error", err, "task_id", taskID)
-		}
+		return
+	}
 
-		for _, art := range artifacts {
-			artEvent := StreamEvent{
-				ArtifactUpdate: &TaskArtifactUpdate{
-					TaskID:   taskID,
-					Artifact: art,
-				},
-			}
-			b.streams.Broadcast(taskID, artEvent)
-			b.push.Dispatch(ctx, taskID, artEvent)
-		}
+	// Content message — broadcast to subscribers but keep task alive.
+	// Task lifecycle is driven by state-change messages, not content.
+	// Touch the DB timestamp so the janitor doesn't reap active tasks
+	// whose only recent activity is content messages.
+	// Use TouchTask (not UpdateTaskState) to preserve the current state —
+	// content messages must not overwrite input-required.
+	a2aMsg, artifacts := TranslateScionToA2A(msg)
 
-		statusEvent := StreamEvent{
-			StatusUpdate: &TaskStatusUpdate{
-				TaskID: taskID,
-				Status: TaskStatus{
-					State:   TaskStateCompleted,
-					Message: &a2aMsg,
-				},
-				Final: true,
+	currentState := TaskStateWorking
+	if task, err := b.store.GetTask(taskID); err != nil {
+		b.log.Error("failed to get task for content message",
+			"task_id", taskID, "error", err)
+	} else if task != nil {
+		currentState = task.State
+	}
+
+	if err := b.store.TouchTask(taskID); err != nil {
+		b.log.Error("failed to refresh task timestamp for content message",
+			"task_id", taskID, "error", err)
+	}
+	for _, art := range artifacts {
+		artEvent := StreamEvent{
+			ArtifactUpdate: &TaskArtifactUpdate{
+				TaskID:   taskID,
+				Artifact: art,
 			},
 		}
-		b.streams.Broadcast(taskID, statusEvent)
-		b.push.Dispatch(ctx, taskID, statusEvent)
-
-		if b.metrics != nil {
-			b.metrics.TasksCompleted.WithLabelValues(TaskStateCompleted).Inc()
-		}
-		b.tasksMu.RLock()
-		aKey := b.activeTasks[taskID].aKey
-		b.tasksMu.RUnlock()
-		b.unregisterActiveTask(taskID, aKey)
+		b.streams.Broadcast(taskID, artEvent)
+		b.push.Dispatch(ctx, taskID, artEvent)
 	}
+
+	statusEvent := StreamEvent{
+		StatusUpdate: &TaskStatusUpdate{
+			TaskID: taskID,
+			Status: TaskStatus{
+				State:   currentState,
+				Message: &a2aMsg,
+			},
+			Final: false,
+		},
+	}
+	b.streams.Broadcast(taskID, statusEvent)
+	b.push.Dispatch(ctx, taskID, statusEvent)
+}
+
+// failFollowUpTask centralises the failure-notification pattern for follow-up
+// messages: update DB state, increment metrics, broadcast a final failure event
+// to SSE/push subscribers, and close streams.  The caller is responsible for
+// unregistering the active task and removing any waiter.
+func (b *Bridge) failFollowUpTask(taskID string) {
+	if err := b.store.UpdateTaskState(taskID, TaskStateFailed); err != nil {
+		b.log.Error("failed to update task state", "error", err, "task_id", taskID)
+	}
+	if b.metrics != nil {
+		b.metrics.TasksCompleted.WithLabelValues(TaskStateFailed).Inc()
+	}
+	failEvent := StreamEvent{
+		StatusUpdate: &TaskStatusUpdate{
+			TaskID: taskID,
+			Status: TaskStatus{State: TaskStateFailed},
+			Final:  true,
+		},
+	}
+	b.streams.Broadcast(taskID, failEvent)
+	b.push.Dispatch(b.shutdownCtx, taskID, failEvent)
+	b.streams.CloseAll(taskID)
 }
 
 func truncate(s string, n int) string {
@@ -730,8 +877,8 @@ func (b *Bridge) GenerateAgentCard(ctx context.Context, projectSlug, agentSlug s
 		"url":         agentURL,
 		"version":     "1.0.0",
 		"capabilities": map[string]bool{
-			"streaming":         false,
-			"pushNotifications": false,
+			"streaming":         true,
+			"pushNotifications": true,
 		},
 		"defaultInputModes":  []string{"text/plain", "application/json"},
 		"defaultOutputModes": []string{"text/plain", "application/json"},
@@ -904,8 +1051,12 @@ func (b *Bridge) resolveContext(ctx context.Context, projectSlug, agentSlug, con
 func (b *Bridge) registerActiveTask(taskID, aKey string) {
 	b.tasksMu.Lock()
 	defer b.tasksMu.Unlock()
+	// Only append to agentTasks if the task is not already registered,
+	// preventing duplicate entries from concurrent follow-ups.
+	if _, exists := b.activeTasks[taskID]; !exists {
+		b.agentTasks[aKey] = append(b.agentTasks[aKey], taskID)
+	}
 	b.activeTasks[taskID] = activeTaskEntry{aKey: aKey, createdAt: time.Now()}
-	b.agentTasks[aKey] = append(b.agentTasks[aKey], taskID)
 }
 
 func (b *Bridge) unregisterActiveTask(taskID, aKey string) {
@@ -937,19 +1088,16 @@ func (b *Bridge) removeWaiter(taskID string) {
 }
 
 // parseTopic extracts project and agent identifiers from a broker topic string.
-// Expected format: scion.project.<projectID>.user.<user>.messages (6 segments).
-// The 5-segment agent form (scion.project.<g>.agent.<a>) is parsed but currently
-// unused — the bridge only subscribes to user-scoped topics.
+// Canonical scion.project topics and legacy scion.grove topics are accepted.
 func parseTopic(topic string) (projectID, agentSlug string, err error) {
-	parts := strings.Split(topic, ".")
-	if len(parts) < 3 || parts[0] != "scion" || (parts[1] != "project" && parts[1] != "grove") {
+	parsed, err := projectcompat.ParseTopic(topic)
+	if err != nil {
 		return "", "", fmt.Errorf("malformed topic: %s", topic)
 	}
-	projectID = parts[2]
-	if len(parts) >= 5 && parts[3] == "agent" {
-		agentSlug = parts[4]
+	if parsed.Kind == projectcompat.TopicKindAgent {
+		agentSlug = parsed.Actor
 	}
-	return projectID, agentSlug, nil
+	return parsed.ProjectID, agentSlug, nil
 }
 
 func extractProjectIDFromTopic(topic string) string {

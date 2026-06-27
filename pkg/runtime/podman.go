@@ -27,6 +27,7 @@ import (
 
 	"github.com/GoogleCloudPlatform/scion/pkg/api"
 	"github.com/GoogleCloudPlatform/scion/pkg/gcp"
+	"github.com/GoogleCloudPlatform/scion/pkg/projectcompat"
 	"github.com/GoogleCloudPlatform/scion/pkg/util"
 )
 
@@ -125,6 +126,16 @@ func (r *PodmanRuntime) ExecUser() string {
 }
 
 func (r *PodmanRuntime) Run(ctx context.Context, config RunConfig) (string, error) {
+	// N1-5: Podman rootless + NFS is unsupported. keep-id subuid ranges
+	// yield no stable on-wire UID, so files on the shared NFS export would
+	// have unpredictable ownership across nodes. Reject early with a clear
+	// error (design §9.1).
+	if r.Rootless && config.WorkspaceBackendName == "nfs" {
+		return "", fmt.Errorf("podman rootless with NFS workspace backend is not supported: " +
+			"keep-id subuid ranges cannot produce a stable on-wire UID for shared NFS storage; " +
+			"use rootful Docker or Podman for NFS-backed projects")
+	}
+
 	// Stage file and variable secrets before building args
 	var secretMountSpecs []string
 	if config.HomeDir != "" && len(config.ResolvedSecrets) > 0 {
@@ -274,7 +285,18 @@ func (r *PodmanRuntime) List(ctx context.Context, labelFilter map[string]string)
 		// Filter by labels if requested
 		match := true
 		for k, v := range labelFilter {
-			if labels[k] != v {
+			actual := labels[k]
+			if actual == "" {
+				switch k {
+				case projectcompat.LabelProject:
+					actual = projectcompat.ProjectNameFromLabels(labels)
+				case projectcompat.LabelProjectID:
+					actual = projectcompat.ProjectIDFromLabels(labels)
+				case projectcompat.LabelProjectPath:
+					actual = projectcompat.ProjectPathFromLabels(labels)
+				}
+			}
+			if actual != v {
 				match = false
 				break
 			}
@@ -300,9 +322,9 @@ func (r *PodmanRuntime) List(ctx context.Context, labelFilter map[string]string)
 				Template:        labels["scion.template"],
 				HarnessConfig:   labels["scion.harness_config"],
 				HarnessAuth:     labels["scion.harness_auth"],
-				Project:         labels["scion.grove"],
-				ProjectID:       labels["scion.grove_id"],
-				ProjectPath:     labels["scion.grove_path"],
+				Project:         projectcompat.ProjectNameFromLabels(labels),
+				ProjectID:       projectcompat.ProjectIDFromLabels(labels),
+				ProjectPath:     projectcompat.ProjectPathFromLabels(labels),
 				Runtime:         r.Name(),
 			})
 		}

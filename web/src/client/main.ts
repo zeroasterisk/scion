@@ -128,15 +128,23 @@ interface RouteConfig {
 const ROUTES: RouteConfig[] = [
   { pattern: /^\/login$/, tag: 'scion-login-page', load: () => import('../components/pages/login.js') },
   { pattern: /^\/invite$/, tag: 'scion-page-invite', load: () => import('../components/pages/invite.js') },
+  { pattern: /^\/onboarding$/, tag: 'scion-page-onboarding', load: () => import('../components/pages/onboarding.js') },
   { pattern: /^\/$/, tag: 'scion-page-home', load: () => import('../components/pages/home.js') },
   { pattern: /^\/projects$/, tag: 'scion-page-projects', load: () => import('../components/pages/projects.js') },
   { pattern: /^\/agents$/, tag: 'scion-page-agents', load: () => import('../components/pages/agents.js') },
   { pattern: /^\/brokers$/, tag: 'scion-page-brokers', load: () => import('../components/pages/brokers.js') },
   { pattern: /^\/brokers\/[^/]+$/, tag: 'scion-page-broker-detail', load: () => import('../components/pages/broker-detail.js') },
+  { pattern: /^\/skills$/, tag: 'scion-page-skills', load: () => import('../components/pages/skills.js') },
+  { pattern: /^\/skills\/new$/, tag: 'scion-page-skill-create', load: () => import('../components/pages/skill-create.js') },
+  { pattern: /^\/skills\/[^/]+$/, tag: 'scion-page-skill-detail', load: () => import('../components/pages/skill-detail.js') },
+  { pattern: /^\/admin\/skill-registries$/, tag: 'scion-page-admin-skill-registries', load: () => import('../components/pages/admin-skill-registries.js') },
+  { pattern: /^\/admin\/skill-registries\/[^/]+$/, tag: 'scion-page-admin-skill-registry-detail', load: () => import('../components/pages/admin-skill-registry-detail.js') },
   { pattern: /^\/admin\/scheduler$/, tag: 'scion-page-admin-scheduler', load: () => import('../components/pages/admin-scheduler.js') },
   { pattern: /^\/admin\/users$/, tag: 'scion-page-admin-users', load: () => import('../components/pages/admin-users.js') },
   { pattern: /^\/admin\/groups$/, tag: 'scion-page-admin-groups', load: () => import('../components/pages/admin-groups.js') },
   { pattern: /^\/admin\/groups\/[^/]+$/, tag: 'scion-page-admin-group-detail', load: () => import('../components/pages/admin-group-detail.js') },
+  { pattern: /^\/metrics$/, tag: 'scion-page-metrics', load: () => import('../components/pages/metrics-dashboard.js') },
+  { pattern: /^\/admin\/metrics$/, tag: 'scion-page-metrics', load: () => import('../components/pages/metrics-dashboard.js') },
   { pattern: /^\/admin\/maintenance$/, tag: 'scion-page-admin-maintenance', load: () => import('../components/pages/admin-maintenance.js') },
   { pattern: /^\/admin\/server-config$/, tag: 'scion-page-admin-server-config', load: () => import('../components/pages/admin-server-config.js') },
   { pattern: /^\/settings$/, tag: 'scion-page-settings', load: () => import('../components/pages/settings.js') },
@@ -147,6 +155,7 @@ const ROUTES: RouteConfig[] = [
   { pattern: /^\/profile\/settings$/, tag: 'scion-page-profile-settings', load: () => import('../components/pages/profile-settings.js') },
   { pattern: /^\/profile\/tokens$/, tag: 'scion-page-profile-tokens', load: () => import('../components/pages/profile-tokens.js') },
   { pattern: /^\/profile\/telegram$/, tag: 'scion-page-profile-telegram', load: () => import('../components/pages/profile-telegram.js') },
+  { pattern: /^\/profile\/discord$/, tag: 'scion-page-profile-discord', load: () => import('../components/pages/profile-discord.js') },
   { pattern: /^\/profile$/, tag: 'scion-page-profile-env-vars', load: () => import('../components/pages/profile-env-vars.js') },
   { pattern: /^\/github-app\/installed$/, tag: 'scion-page-github-app-setup', load: () => import('../components/pages/github-app-setup.js') },
   { pattern: /^\/projects\/new$/, tag: 'scion-page-project-create', load: () => import('../components/pages/project-create.js') },
@@ -154,6 +163,7 @@ const ROUTES: RouteConfig[] = [
   { pattern: /^\/projects\/[^/]+\/templates\/[^/]+$/, tag: 'scion-page-template-detail', load: () => import('../components/pages/template-detail.js') },
   { pattern: /^\/projects\/[^/]+\/harness-configs\/[^/]+$/, tag: 'scion-page-harness-config-detail', load: () => import('../components/pages/harness-config-detail.js') },
   { pattern: /^\/projects\/[^/]+\/schedules$/, tag: 'scion-page-project-schedules', load: () => import('../components/pages/project-schedules.js') },
+  { pattern: /^\/projects\/[^/]+\/metrics$/, tag: 'scion-page-metrics', load: () => import('../components/pages/metrics-dashboard.js') },
   { pattern: /^\/projects\/[^/]+$/, tag: 'scion-page-project-detail', load: () => import('../components/pages/project-detail.js') },
   { pattern: /^\/agents\/new$/, tag: 'scion-page-agent-create', load: () => import('../components/pages/agent-create.js') },
   { pattern: /^\/agents\/[^/]+\/configure$/, tag: 'scion-page-agent-configure', load: () => import('../components/pages/agent-configure.js') },
@@ -164,17 +174,17 @@ const ROUTES: RouteConfig[] = [
 /**
  * Routes that render without the app shell (full-page layout)
  */
-const STANDALONE_ROUTES = new Set(['scion-login-page', 'scion-page-invite']);
+const STANDALONE_ROUTES = new Set(['scion-login-page', 'scion-page-invite', 'scion-page-onboarding']);
 
 /**
  * Routes that render inside the profile shell instead of the main app shell
  */
-const PROFILE_ROUTES = new Set(['scion-page-profile-env-vars', 'scion-page-profile-secrets', 'scion-page-profile-settings', 'scion-page-profile-tokens', 'scion-page-profile-telegram']);
+const PROFILE_ROUTES = new Set(['scion-page-profile-env-vars', 'scion-page-profile-secrets', 'scion-page-profile-settings', 'scion-page-profile-tokens', 'scion-page-profile-telegram', 'scion-page-profile-discord']);
 
 /**
  * Routes that require admin role. Non-admin users are redirected to dashboard.
  */
-const ADMIN_ROUTES = new Set(['scion-page-settings', 'scion-page-admin-scheduler', 'scion-page-admin-maintenance', 'scion-page-admin-users', 'scion-page-admin-groups', 'scion-page-admin-group-detail', 'scion-page-admin-server-config']);
+const ADMIN_ROUTES = new Set(['scion-page-settings', 'scion-page-admin-scheduler', 'scion-page-admin-maintenance', 'scion-page-admin-users', 'scion-page-admin-groups', 'scion-page-admin-group-detail', 'scion-page-admin-server-config', 'scion-page-admin-skill-registries', 'scion-page-admin-skill-registry-detail']);
 
 /**
  * Initialize the client-side application
@@ -220,6 +230,23 @@ async function init(): Promise<void> {
   ]);
 
   console.info('[Scion] Components defined, setting up router...');
+
+  // First-run redirect: if the system hasn't completed onboarding, navigate to /onboarding
+  const skipRedirectPaths = ['/onboarding', '/login', '/invite'];
+  if (!skipRedirectPaths.includes(window.location.pathname)) {
+    try {
+      const statusRes = await fetch('/api/v1/system/status', { credentials: 'include' });
+      if (statusRes.ok) {
+        const status = await statusRes.json();
+        if (!status.complete) {
+          sessionStorage.setItem('onboardingStatus', JSON.stringify(status));
+          window.history.replaceState({}, '', '/onboarding');
+        }
+      }
+    } catch {
+      // System status endpoint unavailable (non-workstation mode) — skip redirect
+    }
+  }
 
   // Render the initial page based on current URL
   await renderRoute(window.location.pathname);

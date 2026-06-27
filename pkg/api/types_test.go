@@ -174,11 +174,39 @@ func TestVolumeMountValidate(t *testing.T) {
 			wantErr: "missing required field: source",
 		},
 		{
+			name: "valid nfs",
+			vol: VolumeMount{
+				Source: "/scion-workspaces",
+				Target: "/workspace",
+				Type:   "nfs",
+				Server: "10.0.0.2",
+			},
+			wantErr: "",
+		},
+		{
+			name: "nfs missing server",
+			vol: VolumeMount{
+				Source: "/scion-workspaces",
+				Target: "/workspace",
+				Type:   "nfs",
+			},
+			wantErr: "missing required field: server",
+		},
+		{
+			name: "nfs missing source",
+			vol: VolumeMount{
+				Target: "/workspace",
+				Type:   "nfs",
+				Server: "10.0.0.2",
+			},
+			wantErr: "missing required field: source",
+		},
+		{
 			name: "invalid type",
 			vol: VolumeMount{
 				Source: "/host/path",
 				Target: "/container/path",
-				Type:   "nfs",
+				Type:   "bogus",
 			},
 			wantErr: "invalid type",
 		},
@@ -189,6 +217,42 @@ func TestVolumeMountValidate(t *testing.T) {
 				Type:   "gcs",
 			},
 			wantErr: "missing required field: bucket",
+		},
+		// cloudrun-volume tests
+		{
+			name: "valid cloudrun-volume",
+			vol: VolumeMount{
+				Target:     "/workspace",
+				Type:       "cloudrun-volume",
+				VolumeName: "workspace-vol",
+			},
+			wantErr: "",
+		},
+		{
+			name: "cloudrun-volume missing volume_name",
+			vol: VolumeMount{
+				Target: "/workspace",
+				Type:   "cloudrun-volume",
+			},
+			wantErr: "missing required field: volume_name",
+		},
+		// gke-shared-volume tests
+		{
+			name: "valid gke-shared-volume",
+			vol: VolumeMount{
+				Target:     "/workspace",
+				Type:       "gke-shared-volume",
+				VolumeName: "shared-ws",
+			},
+			wantErr: "",
+		},
+		{
+			name: "gke-shared-volume missing volume_name",
+			vol: VolumeMount{
+				Target: "/workspace",
+				Type:   "gke-shared-volume",
+			},
+			wantErr: "missing required field: volume_name",
 		},
 	}
 

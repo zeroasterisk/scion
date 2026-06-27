@@ -31,6 +31,7 @@ import (
 	"github.com/GoogleCloudPlatform/scion/pkg/apiclient"
 	"github.com/GoogleCloudPlatform/scion/pkg/config"
 	"github.com/GoogleCloudPlatform/scion/pkg/harness"
+	"github.com/GoogleCloudPlatform/scion/pkg/projectcompat"
 	"github.com/GoogleCloudPlatform/scion/pkg/runtime"
 	"github.com/GoogleCloudPlatform/scion/pkg/util"
 )
@@ -65,12 +66,12 @@ func (m *AgentManager) Start(ctx context.Context, opts api.StartOptions) (*api.A
 	projectName := config.GetProjectName(projectDir)
 
 	// Determine the project ID for label-based filtering. In broker/hosted mode
-	// this comes from the SCION_GROVE_ID env var injected by the hub dispatcher.
+	// this comes from env injected by the hub dispatcher.
 	projectID := ""
 	if opts.Env != nil {
-		projectID = opts.Env["SCION_GROVE_ID"]
+		projectID = opts.Env["SCION_PROJECT_ID"]
 		if projectID == "" {
-			projectID = opts.Env["SCION_PROJECT_ID"]
+			projectID = opts.Env["SCION_GROVE_ID"]
 		}
 	}
 
@@ -340,6 +341,7 @@ func (m *AgentManager) Start(ctx context.Context, opts api.StartOptions) (*api.A
 	var h api.Harness
 	var harnessConfigRevision string
 	var resolvedImpl string
+	var noAuthConfig *config.HarnessNoAuthConfig
 	if harnessConfigName != "" {
 		var resolveTemplatePaths []string
 		if opts.Template != "" {
@@ -359,6 +361,7 @@ func (m *AgentManager) Start(ctx context.Context, opts api.StartOptions) (*api.A
 			TemplatePaths: resolveTemplatePaths,
 			ProfileName:   profileName,
 			Settings:      settings,
+			ConfigDirPath: opts.HarnessConfigPath,
 		})
 		if err != nil {
 			util.Debugf("harness.Resolve fell back to New(%q): %v", harnessName, err)
@@ -366,6 +369,7 @@ func (m *AgentManager) Start(ctx context.Context, opts api.StartOptions) (*api.A
 		} else {
 			h = resolved.Harness
 			resolvedImpl = resolved.Implementation
+			noAuthConfig = resolved.Config.NoAuthConfig
 			if resolved.ConfigDir != nil {
 				harnessConfigRevision = config.ComputeHarnessConfigRevision(resolved.ConfigDir.Path)
 			}
@@ -882,9 +886,16 @@ func (m *AgentManager) Start(ctx context.Context, opts api.StartOptions) (*api.A
 			}
 			return nil
 		}(),
-		GitClone:             opts.GitClone,
-		SharedDirs:           effectiveSharedDirs,
-		BrokerMode:           opts.BrokerMode,
+		GitClone:   opts.GitClone,
+		SharedDirs: effectiveSharedDirs,
+		BrokerMode: opts.BrokerMode,
+		NoAuth:     opts.NoAuth && noAuthConfig != nil && noAuthConfig.Behavior == "drop-to-shell",
+		NoAuthMessage: func() string {
+			if opts.NoAuth && noAuthConfig != nil && noAuthConfig.Behavior == "drop-to-shell" {
+				return noAuthConfig.Message
+			}
+			return ""
+		}(),
 		Debug:                util.DebugEnabled(),
 		Resume:               opts.Resume,
 		MetadataInterception: hasMetadataInterception(agentEnv),
@@ -894,28 +905,22 @@ func (m *AgentManager) Start(ctx context.Context, opts api.StartOptions) (*api.A
 			l := map[string]string{
 				"scion.agent":          "true",
 				"scion.name":           api.Slugify(opts.Name),
-				"scion.project":        projectName,
-				"scion.grove":          projectName,
 				"scion.template":       template,
 				"scion.harness_config": harnessConfigName,
 				"scion.harness_auth":   opts.HarnessAuth,
 			}
+			for k, v := range projectcompat.ProjectNameLabels(projectName, true) {
+				l[k] = v
+			}
 			// Add project_id label for project-scoped agent isolation.
-			// In broker/hosted mode this comes from the SCION_GROVE_ID or
-			// SCION_PROJECT_ID env var injected by the hub dispatcher.
-			if projectID := opts.Env["SCION_GROVE_ID"]; projectID != "" {
-				l["scion.project_id"] = projectID
-				l["scion.grove_id"] = projectID
-			} else if projectID := opts.Env["SCION_PROJECT_ID"]; projectID != "" {
-				l["scion.project_id"] = projectID
-				l["scion.grove_id"] = projectID
+			if projectID != "" {
+				for k, v := range projectcompat.ProjectIDLabels(projectID, true) {
+					l[k] = v
+				}
 			}
 			return l
 		}(),
-		Annotations: map[string]string{
-			"scion.project_path": projectDir,
-			"scion.grove_path":   projectDir,
-		},
+		Annotations: projectcompat.ProjectPathLabels(projectDir, true),
 	}
 	id, err := m.Runtime.Run(ctx, runCfg)
 	if err != nil {
@@ -1005,12 +1010,9 @@ func filterWorkspaceVolume(volumes []api.VolumeMount) []api.VolumeMount {
 // It checks the project_id label first (authoritative in hosted mode), then
 // falls back to the project name label.
 func matchAgentProject(a api.AgentInfo, projectName, projectID string) bool {
-	// If we have a projectID, check the scion.project_id or scion.grove_id label (authoritative, grove_id for backward compat)
+	// If we have a projectID, check the canonical project label first.
 	if projectID != "" {
-		if labelProjectID := a.Labels["scion.project_id"]; labelProjectID != "" {
-			return labelProjectID == projectID
-		}
-		if labelProjectID := a.Labels["scion.grove_id"]; labelProjectID != "" {
+		if labelProjectID := projectcompat.ProjectIDFromLabels(a.Labels); labelProjectID != "" {
 			return labelProjectID == projectID
 		}
 		if a.ProjectID != "" {
@@ -1019,10 +1021,7 @@ func matchAgentProject(a api.AgentInfo, projectName, projectID string) bool {
 	}
 	// Fall back to project name matching
 	if projectName != "" {
-		if labelProject := a.Labels["scion.project"]; labelProject != "" {
-			return labelProject == projectName
-		}
-		if labelProject := a.Labels["scion.grove"]; labelProject != "" {
+		if labelProject := projectcompat.ProjectNameFromLabels(a.Labels); labelProject != "" {
 			return labelProject == projectName
 		}
 		if a.Project != "" {

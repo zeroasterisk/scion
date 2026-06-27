@@ -19,6 +19,14 @@ package state
 
 import "fmt"
 
+// HarnessExitCodeFile is the container-local path where the tmux agent-window
+// wrapper records the harness's real exit code, read by `sciontool init`.
+// There is one agent per container, so a fixed path is safe. It is a shared
+// contract: the runtime writes the file and `sciontool init` reads it to
+// recover the authoritative harness exit code (the harness runs as a tmux
+// grandchild whose exit code is otherwise invisible to the supervisor).
+const HarnessExitCodeFile = "/tmp/scion-harness-exit-code"
+
 // Phase represents the infrastructure lifecycle phase of an agent.
 // Phase is controlled by platform operations (broker commands, heartbeats,
 // container events) — not by the LLM agent itself.
@@ -54,6 +62,35 @@ func Phases() []Phase {
 	out := make([]Phase, len(allPhases))
 	copy(out, allPhases)
 	return out
+}
+
+// Ordinal returns the forward-progress ordering of a phase.
+// Higher values represent later lifecycle stages.
+// Returns 0 for terminal or special phases (stopped, error, suspended, stopping)
+// where regression checks do not apply.
+func (p Phase) Ordinal() int {
+	switch p {
+	case PhaseCreated:
+		return 1
+	case PhaseProvisioning:
+		return 2
+	case PhaseCloning:
+		return 3
+	case PhaseStarting:
+		return 4
+	case PhaseRunning:
+		return 5
+	default:
+		return 0
+	}
+}
+
+// IsActivePhase reports whether this phase is part of the forward-progress
+// lifecycle (created through running). Regression guards apply only between
+// active phases — terminal phases (stopped, error) and special phases
+// (suspended, stopping) are excluded.
+func (p Phase) IsActivePhase() bool {
+	return p.Ordinal() > 0
 }
 
 // String implements fmt.Stringer.
@@ -157,6 +194,18 @@ func (a Activity) IsSticky() bool {
 func (a Activity) IsTerminal() bool {
 	switch a {
 	case ActivityCrashed, ActivityLimitsExceeded:
+		return true
+	}
+	return false
+}
+
+// ImpliesRunning reports whether this activity implies the agent must be in
+// PhaseRunning. Used for auto-correcting a stale pre-running phase when the
+// agent is clearly active.
+func (a Activity) ImpliesRunning() bool {
+	switch a {
+	case ActivityWorking, ActivityThinking, ActivityExecuting,
+		ActivityWaitingForInput, ActivityBlocked, ActivityCompleted:
 		return true
 	}
 	return false

@@ -110,7 +110,7 @@ func (s *Server) bootstrapSingleHarnessConfig(ctx context.Context, name, dirPath
 // (§7.3). stor is unused — the store resolves the backend itself — but is kept
 // in the signature to match the bundled-import call sites.
 func (s *Server) bootstrapSingleHarnessConfigScoped(ctx context.Context, name, dirPath string, hcDir *config.HarnessConfigDir, _ storage.Storage, scope, scopeID string) error {
-	_, err := s.harnessConfigStore(hcDir.Config.Harness).Bootstrap(ctx, name, dirPath, scope, scopeID, false)
+	_, err := s.harnessConfigStore(hcDir.Config.Harness).Bootstrap(ctx, name, dirPath, scope, scopeID, "", false)
 	return err
 }
 
@@ -130,7 +130,7 @@ func isHarnessConfigDir(dir string) bool {
 // routing through it also gives harness-config remote import the GITHUB_TOKEN
 // secret fallback that templates already had.
 func (s *Server) importHarnessConfigsFromRemote(ctx context.Context, projectID, sourceURL string) ([]string, error) {
-	return s.importFromRemote(ctx, projectID, sourceURL, store.HarnessConfigScopeProject, s.harnessConfigImportKind(), nil)
+	return s.importFromRemote(ctx, projectID, sourceURL, store.HarnessConfigScopeProject, s.harnessConfigImportKind(), nil, nil)
 }
 
 // importHarnessConfigsFromWorkspace imports harness-configs from a path within
@@ -139,7 +139,7 @@ func (s *Server) importHarnessConfigsFromRemote(ctx context.Context, projectID, 
 //
 // This is a thin wrapper over the shared import driver (resource_import.go).
 func (s *Server) importHarnessConfigsFromWorkspace(ctx context.Context, project *store.Project, workspacePath string) ([]string, error) {
-	return s.importFromWorkspace(ctx, project, workspacePath, store.HarnessConfigScopeProject, s.harnessConfigImportKind(), nil)
+	return s.importFromWorkspace(ctx, project, workspacePath, store.HarnessConfigScopeProject, s.harnessConfigImportKind(), nil, nil)
 }
 
 // syncExistingHarnessConfig re-syncs a local harness config directory through
@@ -147,5 +147,5 @@ func (s *Server) importHarnessConfigsFromWorkspace(ctx context.Context, project 
 // force is true the config is re-uploaded and storage reconciled even if the
 // content hash is unchanged (used by direct imports).
 func (s *Server) syncExistingHarnessConfig(ctx context.Context, existing *store.HarnessConfig, dirPath string, hcDir *config.HarnessConfigDir, _ storage.Storage, force bool) (bool, error) {
-	return s.harnessConfigStore(hcDir.Config.Harness).Bootstrap(ctx, existing.Name, dirPath, existing.Scope, existing.ScopeID, force)
+	return s.harnessConfigStore(hcDir.Config.Harness).Bootstrap(ctx, existing.Name, dirPath, existing.Scope, existing.ScopeID, "", force)
 }

@@ -48,7 +48,11 @@ const PAGE_TITLES: Record<string, string> = {
   '/admin/users': 'Users',
   '/admin/groups': 'Groups',
   '/admin/server-config': 'Server Config',
+  '/metrics': 'Metrics',
+  '/admin/skill-registries': 'Skill Registries',
+  '/skills': 'Skills',
   '/github-app/installed': 'GitHub App Setup',
+  '/onboarding': 'Setup',
 };
 
 @customElement('scion-app')
@@ -318,6 +322,9 @@ export class ScionApp extends LitElement {
     if (this.currentPath.match(/^\/projects\/[^/]+\/schedules$/)) {
       return 'Schedules';
     }
+    if (this.currentPath.match(/^\/projects\/[^/]+\/metrics$/)) {
+      return 'Project Metrics';
+    }
     if (this.currentPath.match(/^\/projects\/[^/]+\/templates\/[^/]+$/)) {
       return 'Template';
     }
@@ -339,11 +346,26 @@ export class ScionApp extends LitElement {
     if (this.currentPath.startsWith('/brokers/')) {
       return 'Broker';
     }
+    if (this.currentPath.match(/^\/settings\/harness-configs\/[^/]+$/)) {
+      return 'Harness Config';
+    }
+    if (this.currentPath.match(/^\/settings\/templates\/[^/]+$/)) {
+      return 'Template';
+    }
     if (this.currentPath.match(/^\/admin\/groups\/[^/]+$/)) {
       return 'Group';
     }
     if (this.currentPath === '/admin/maintenance') {
       return 'Maintenance';
+    }
+    if (this.currentPath === '/skills/new') {
+      return 'Create Skill';
+    }
+    if (this.currentPath.startsWith('/skills/')) {
+      return 'Skill';
+    }
+    if (this.currentPath.match(/^\/admin\/skill-registries\/[^/]+$/)) {
+      return 'Skill Registry';
     }
 
     return 'Page Not Found';

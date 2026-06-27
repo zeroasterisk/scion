@@ -26,7 +26,6 @@ import (
 	"github.com/GoogleCloudPlatform/scion/pkg/agent/state"
 	"github.com/GoogleCloudPlatform/scion/pkg/api"
 	"github.com/GoogleCloudPlatform/scion/pkg/store"
-	"github.com/GoogleCloudPlatform/scion/pkg/store/sqlite"
 )
 
 // trackingEventPublisher records PublishAgentStatus calls for test assertions.
@@ -50,6 +49,7 @@ func (t *trackingEventPublisher) publishedAgents() []*store.Agent {
 	return result
 }
 
+//nolint:unused // Kept for test diagnostics when extending heartbeat timeout cases.
 func (t *trackingEventPublisher) reset() {
 	t.mu.Lock()
 	defer t.mu.Unlock()
@@ -59,14 +59,14 @@ func (t *trackingEventPublisher) reset() {
 func setupHeartbeatTestServer(t *testing.T) (*Server, store.Store, *trackingEventPublisher) {
 	t.Helper()
 
-	s, err := sqlite.New(":memory:")
+	s, err := newTestStore(":memory:")
 	if err != nil {
 		t.Fatalf("failed to create test store: %v", err)
 	}
 	if err := s.Migrate(context.Background()); err != nil {
 		t.Fatalf("failed to migrate test store: %v", err)
 	}
-	t.Cleanup(func() { s.Close() })
+	t.Cleanup(func() { _ = s.Close() })
 
 	ep := &trackingEventPublisher{}
 

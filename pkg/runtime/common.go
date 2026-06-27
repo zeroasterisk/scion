@@ -24,10 +24,14 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
+	"github.com/GoogleCloudPlatform/scion/pkg/agent/state"
 	"github.com/GoogleCloudPlatform/scion/pkg/api"
+	"github.com/GoogleCloudPlatform/scion/pkg/projectcompat"
 	"github.com/GoogleCloudPlatform/scion/pkg/util"
 )
 
@@ -277,9 +281,30 @@ func buildCommonRunArgs(config RunConfig) ([]string, error) {
 		}
 	}
 
-	// Pass host user UID/GID for container user synchronization
-	addEnv("SCION_HOST_UID", fmt.Sprintf("%d", os.Getuid()))
-	addEnv("SCION_HOST_GID", fmt.Sprintf("%d", os.Getgid()))
+	// Pass host user UID/GID for container user synchronization.
+	// N1-5: branch on workspace backend — NFS needs a stable, node-independent
+	// UID/GID (default 1000:1000) so files written by agents on different nodes
+	// have consistent ownership on the shared filesystem. The local backend
+	// continues to use the broker's host UID/GID (today's behavior, unchanged).
+	uid, gid := os.Getuid(), os.Getgid()
+	if config.WorkspaceBackendName == "nfs" {
+		uid, gid = config.NFSUID, config.NFSGID
+		if uid == 0 {
+			uid = 1000 // default stable NFS UID
+		}
+		if gid == 0 {
+			gid = 1000 // default stable NFS GID
+		}
+	}
+	addEnv("SCION_HOST_UID", fmt.Sprintf("%d", uid))
+	addEnv("SCION_HOST_GID", fmt.Sprintf("%d", gid))
+
+	// Expose the workspace backend to the container so sciontool init can
+	// skip the per-start recursive chown when backend=nfs (slow/racy over
+	// the network; ownership is set once by operator + provisioner).
+	if config.WorkspaceBackendName != "" {
+		addEnv("SCION_WORKSPACE_BACKEND", config.WorkspaceBackendName)
+	}
 
 	// Phase 3 & 5: Project identity injection
 	addEnv("SCION_PROJECT", config.Project)
@@ -389,12 +414,12 @@ func buildCommonRunArgs(config RunConfig) ([]string, error) {
 
 	// Phase 5: Standard project labels
 	if config.Project != "" {
-		addArg("--label", fmt.Sprintf("scion.project=%s", config.Project))
-		addArg("--label", fmt.Sprintf("scion.grove=%s", config.Project))
+		addArg("--label", fmt.Sprintf("%s=%s", projectcompat.LabelProject, config.Project))
+		addArg("--label", fmt.Sprintf("%s=%s", projectcompat.LabelGrove, config.Project))
 	}
 	if config.ProjectID != "" {
-		addArg("--label", fmt.Sprintf("scion.project_id=%s", config.ProjectID))
-		addArg("--label", fmt.Sprintf("scion.grove_id=%s", config.ProjectID))
+		addArg("--label", fmt.Sprintf("%s=%s", projectcompat.LabelProjectID, config.ProjectID))
+		addArg("--label", fmt.Sprintf("%s=%s", projectcompat.LabelGroveID, config.ProjectID))
 	}
 
 	if config.Template != "" {
@@ -403,7 +428,13 @@ func buildCommonRunArgs(config RunConfig) ([]string, error) {
 
 	// Get command from harness
 	var harnessArgs []string
-	if config.Harness != nil {
+	if config.NoAuth {
+		if config.NoAuthMessage != "" {
+			harnessArgs = []string{"sh", "-c", fmt.Sprintf("printf '%%s\\n' %s; exec bash", shellQuote(config.NoAuthMessage))}
+		} else {
+			harnessArgs = []string{"bash"}
+		}
+	} else if config.Harness != nil {
 		harnessArgs = config.Harness.GetCommand(config.Task, config.Resume, config.CommandArgs)
 	} else {
 		return nil, fmt.Errorf("no harness provided")
@@ -418,11 +449,19 @@ func buildCommonRunArgs(config RunConfig) ([]string, error) {
 	}
 	cmdLine := strings.Join(quotedArgs, " ")
 
+	// Wrap the harness in a shell that records its real exit code to a fixed
+	// file. The harness runs as a tmux grandchild, so its exit code is
+	// otherwise invisible to the `sciontool init` supervisor (which only sees
+	// the sh/container exit code). Writing $? lets init read the authoritative
+	// harness exit code and report crashes correctly. The whole wrapper is
+	// single-quoted again so tmux's command parser treats it as one word.
+	agentWindowCmd := "sh -c " + shellQuote(cmdLine+"; echo $? > "+state.HarnessExitCodeFile)
+
 	// Build tmux command: create session with "agent" window running the harness,
 	// then add a "shell" window and switch back to the agent window.
 	tmuxCmd := fmt.Sprintf(
 		"tmux new-session -d -s scion -n agent %s \\; set-option -g window-size latest \\; new-window -t scion -n shell \\; select-window -t scion:agent \\; attach-session -t scion",
-		cmdLine,
+		agentWindowCmd,
 	)
 
 	if len(fuseMounts) > 0 {
@@ -558,12 +597,25 @@ func expandTildeTarget(target, containerHome string) string {
 	return target
 }
 
+// ForceHostNetworkEnvVar, when set to a non-empty value in the broker's
+// environment, forces colocated Docker agents back onto host networking. It is
+// the escape hatch that reverts to the pre-bridge behavior without a redeploy.
+const ForceHostNetworkEnvVar = "SCION_FORCE_HOST_NETWORK"
+
+// forceHostNetworking reports whether the host-networking escape hatch is set.
+func forceHostNetworking() bool {
+	return os.Getenv(ForceHostNetworkEnvVar) != ""
+}
+
 // ResolveDockerNetworking checks whether Docker host networking should be used
 // to allow containers to reach services on the host's loopback interface.
 // When the hub endpoint is localhost or was translated to a Docker bridge
 // hostname (host.docker.internal), it returns "host" and rewrites any bridge
 // hostnames back to localhost in the env map. This avoids the need for the
 // server to bind to 0.0.0.0.
+//
+// When the SCION_FORCE_HOST_NETWORK escape hatch is set, host networking is
+// forced regardless of the endpoint, reverting to the legacy behavior.
 //
 // For non-Docker runtimes or non-localhost endpoints, returns "" (no override).
 func ResolveDockerNetworking(runtimeName string, env map[string]string) string {
@@ -579,14 +631,17 @@ func ResolveDockerNetworking(runtimeName string, env map[string]string) string {
 		return ""
 	}
 
+	// Escape hatch: force host networking regardless of endpoint so a
+	// deployment can revert to the legacy behavior without a redeploy.
+	if forceHostNetworking() {
+		rewriteBridgeHostToLocalhost(env)
+		return "host"
+	}
+
 	// If endpoint uses the Docker bridge hostname (translated from localhost),
 	// rewrite back to localhost since host networking makes it reachable directly.
 	if strings.Contains(ep, "host.docker.internal") {
-		for _, key := range []string{"SCION_HUB_ENDPOINT", "SCION_HUB_URL"} {
-			if v, ok := env[key]; ok {
-				env[key] = strings.Replace(v, "host.docker.internal", "localhost", 1)
-			}
-		}
+		rewriteBridgeHostToLocalhost(env)
 		return "host"
 	}
 
@@ -601,6 +656,76 @@ func ResolveDockerNetworking(runtimeName string, env map[string]string) string {
 	}
 
 	return ""
+}
+
+// rewriteBridgeHostToLocalhost rewrites any host.docker.internal references in
+// the hub endpoint env vars back to localhost, since host networking makes the
+// host loopback reachable directly.
+func rewriteBridgeHostToLocalhost(env map[string]string) {
+	for _, key := range []string{"SCION_HUB_ENDPOINT", "SCION_HUB_URL"} {
+		if v, ok := env[key]; ok {
+			env[key] = strings.Replace(v, "host.docker.internal", "localhost", 1)
+		}
+	}
+}
+
+// DockerSupportsHostGateway reports whether the Docker daemon supports the
+// special "host-gateway" address used by --add-host. Support was added in
+// Docker Engine 20.10; older daemons cannot map a domain to the host, so
+// colocated bridge networking would be unable to reach Caddy and the broker
+// must fall back to host networking. On any probe failure we conservatively
+// assume support is present (the common case on modern hosts) so we don't
+// needlessly disable the fix; a genuinely old daemon will surface the missing
+// host-gateway when the container fails to start, which is rare in practice.
+func DockerSupportsHostGateway(ctx context.Context, command string) bool {
+	if command == "" {
+		command = "docker"
+	}
+	// Bound the probe so an unresponsive Docker daemon cannot hang server
+	// startup indefinitely; on timeout we fall through to the conservative
+	// "assume support" path below.
+	probeCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	out, err := runSimpleCommand(probeCtx, command, "version", "--format", "{{.Server.Version}}")
+	if err != nil {
+		runtimeLog.Debug("Unable to probe Docker server version for host-gateway support", "error", err)
+		return true
+	}
+	major, minor, ok := parseDockerServerVersion(strings.TrimSpace(out))
+	if !ok {
+		runtimeLog.Debug("Unable to parse Docker server version for host-gateway support", "version", out)
+		return true
+	}
+	// host-gateway requires Docker Engine >= 20.10.
+	if major > 20 || (major == 20 && minor >= 10) {
+		return true
+	}
+	return false
+}
+
+// parseDockerServerVersion parses the leading "major.minor" of a Docker server
+// version string (e.g. "24.0.7" or "20.10.21"). It tolerates a leading "v"/"V"
+// prefix and scans line-by-line so daemon warnings or other noise mixed into the
+// command output (runSimpleCommand combines stdout and stderr) do not defeat the
+// probe.
+func parseDockerServerVersion(v string) (major, minor int, ok bool) {
+	for _, line := range strings.Split(v, "\n") {
+		line = strings.TrimLeft(strings.TrimSpace(line), "vV")
+		parts := strings.SplitN(line, ".", 3)
+		if len(parts) < 2 {
+			continue
+		}
+		major, err := strconv.Atoi(parts[0])
+		if err != nil {
+			continue
+		}
+		minor, err = strconv.Atoi(parts[1])
+		if err != nil {
+			continue
+		}
+		return major, minor, true
+	}
+	return 0, 0, false
 }
 
 // BridgeExtraHosts returns the --add-host entries needed for the given runtime
@@ -830,4 +955,24 @@ func phaseFromContainerStatus(status string) string {
 	default:
 		return "created"
 	}
+}
+
+// exitedStatusRe matches the exit code in container-runtime status strings such
+// as "Exited (137) 2 minutes ago" (Docker/Podman) or "exited (0)".
+var exitedStatusRe = regexp.MustCompile(`(?i)exited\s*\((\d+)\)`)
+
+// ExitCodeFromContainerStatus extracts the exit code from a container status
+// string like "Exited (137) 2 minutes ago". It returns (code, true) when an
+// exited status with a parseable code is present, otherwise (0, false). A plain
+// "stopped" (no embedded code) yields (0, false).
+func ExitCodeFromContainerStatus(status string) (int, bool) {
+	m := exitedStatusRe.FindStringSubmatch(status)
+	if m == nil {
+		return 0, false
+	}
+	code, err := strconv.Atoi(m[1])
+	if err != nil {
+		return 0, false
+	}
+	return code, true
 }

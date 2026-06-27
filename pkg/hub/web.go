@@ -17,6 +17,7 @@ package hub
 import (
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -37,6 +38,7 @@ import (
 	"github.com/GoogleCloudPlatform/scion/web"
 	"github.com/gorilla/sessions"
 	"golang.org/x/net/http2"
+	//nolint:staticcheck // h2c is kept for local cleartext HTTP/2 support.
 	"golang.org/x/net/http2/h2c"
 )
 
@@ -123,6 +125,9 @@ type WebServerConfig struct {
 	BaseURL string
 	// DevAuthToken is the dev token for auto-login (empty = disabled).
 	DevAuthToken string
+	// AuthMode is the exclusive human auth mode: "oauth" (default), "proxy", "dev".
+	// In proxy mode, OAuth providers are not shown and logout behavior changes.
+	AuthMode string
 	// AuthorizedDomains is the list of allowed email domains (empty = all allowed).
 	AuthorizedDomains []string
 	// AdminEmails is the list of bootstrap admin emails (bypass domain check).
@@ -133,6 +138,10 @@ type WebServerConfig struct {
 	AdminMode bool
 	// MaintenanceMessage is the custom message shown during admin mode.
 	MaintenanceMessage string
+	// EnableTestLogin enables the POST /api/v1/auth/test-login endpoint
+	// for integration testing. Disabled by default; must never be enabled
+	// in production.
+	EnableTestLogin bool
 }
 
 // WebServer serves the web frontend SPA shell and static assets.
@@ -143,11 +152,11 @@ type WebServer struct {
 	assets       fs.FS  // embedded or nil
 	assetsDisk   string // filesystem override path, or ""
 	shellTmpl    *template.Template
-	sessionStore *sessions.FilesystemStore
+	sessionStore *sessions.CookieStore
 	oauthService *OAuthService
 	store        store.Store
 	userTokenSvc *UserTokenService
-	events       *ChannelEventPublisher      // nil when no publisher configured
+	events       EventPublisher              // nil when no publisher configured
 	hubHandler   http.Handler                // mounted Hub API handler, or nil
 	hubShutdown  func(context.Context) error // Hub resource cleanup, or nil
 	maintenance  *MaintenanceState           // runtime maintenance mode state (shared with Hub)
@@ -420,28 +429,44 @@ func NewWebServer(cfg WebServerConfig) *WebServer {
 		slog.Warn("No session secret configured, using random key (sessions will not persist across restarts)")
 	}
 
-	// Use a filesystem-backed session store so that only a small session ID
-	// is sent as a cookie. This avoids the 4 KB cookie size limit that can
-	// be exceeded when JWT tokens are stored in the session.
-	sessionDir := filepath.Join(os.TempDir(), "scion-sessions")
-	if err := os.MkdirAll(sessionDir, 0700); err != nil {
-		slog.Error("Failed to create session directory", "dir", sessionDir, "error", err)
-	}
-	fsStore := sessions.NewFilesystemStore(sessionDir, []byte(sessionKey))
-	// Remove the default 4096-byte securecookie encoding limit. The
-	// FilesystemStore writes session data to disk (not cookies), so the
-	// browser cookie-size cap is irrelevant. JWT tokens stored in the
-	// session regularly exceed 4096 bytes after gob+base64 encoding,
-	// which causes Save() to fail and tokens to be silently dropped.
-	fsStore.MaxLength(0)
-	fsStore.Options = &sessions.Options{
+	// Use an encrypted, signed cookie session store so that NO session state
+	// lives on a single replica's local filesystem. This is required for
+	// horizontal scaling: behind a load balancer the OAuth login and callback
+	// (and every subsequent API request) can land on different replicas. A
+	// cookie-backed store keeps the whole session — the OAuth CSRF state token,
+	// the post-login return path, the user identity, and the Hub access/refresh
+	// tokens — in the client's signed+encrypted cookie, so any replica sharing
+	// SESSION_SECRET can read it.
+	//
+	// The previous FilesystemStore kept this state on one replica's disk, which
+	// caused intermittent "state_mismatch" login failures (and silently dropped
+	// post-login sessions) whenever the LB routed a follow-up request to a
+	// different replica. The whole session encodes to roughly 2.6 KB today —
+	// well within the browser's ~4 KB per-cookie cap — so the historical
+	// "JWT tokens exceed 4096 bytes" concern that motivated the disk store no
+	// longer applies to the current compact HS256 tokens.
+	//
+	// Keys are derived deterministically from the shared SESSION_SECRET so all
+	// replicas agree: a 32-byte HMAC authentication key and a 32-byte AES-256
+	// encryption key, with domain separation so the two keys differ.
+	cookieStore := sessions.NewCookieStore(
+		deriveSessionKey(sessionKey, "scion-session-hash"),
+		deriveSessionKey(sessionKey, "scion-session-block"),
+	)
+	cookieStore.Options = &sessions.Options{
 		Path:     "/",
 		MaxAge:   86400, // 24 hours
 		HttpOnly: true,
 		Secure:   strings.HasPrefix(cfg.BaseURL, "https://"),
 		SameSite: http.SameSiteLaxMode,
 	}
-	ws.sessionStore = fsStore
+	// Keep securecookie's timestamp window in sync with the cookie MaxAge. We
+	// intentionally leave the default 4096-byte securecookie length limit in
+	// force (unlike the disk store, which disabled it): if a session ever grew
+	// past the browser cookie cap, Save() would return an error we can log
+	// rather than silently emitting an oversized cookie the browser drops.
+	cookieStore.MaxAge(cookieStore.Options.MaxAge)
+	ws.sessionStore = cookieStore
 
 	// Resolve asset source
 	if cfg.AssetsDir != "" {
@@ -471,6 +496,17 @@ func NewWebServer(cfg WebServerConfig) *WebServer {
 	return ws
 }
 
+// deriveSessionKey deterministically derives a 32-byte key from the shared
+// session secret and a label. The label provides domain separation so the
+// HMAC authentication key and the AES encryption key differ even though both
+// originate from the same SESSION_SECRET. Every replica configured with the
+// same secret derives identical keys, which is what lets a session cookie
+// minted by one replica be validated and decrypted by another.
+func deriveSessionKey(secret, label string) []byte {
+	sum := sha256.Sum256([]byte(label + ":" + secret))
+	return sum[:]
+}
+
 // SetMaintenanceState sets the shared runtime maintenance state.
 func (ws *WebServer) SetMaintenanceState(ms *MaintenanceState) {
 	ws.maintenance = ms
@@ -492,7 +528,7 @@ func (ws *WebServer) SetUserTokenService(svc *UserTokenService) {
 }
 
 // SetEventPublisher sets the event publisher for real-time SSE streaming.
-func (ws *WebServer) SetEventPublisher(pub *ChannelEventPublisher) {
+func (ws *WebServer) SetEventPublisher(pub EventPublisher) {
 	ws.events = pub
 }
 
@@ -600,7 +636,7 @@ func (ws *WebServer) sessionToBearerMiddleware(next http.Handler) http.Handler {
 			if isBrowserRequest(r) {
 				w.Header().Set("Content-Type", "application/json")
 				w.WriteHeader(http.StatusUnauthorized)
-				json.NewEncoder(w).Encode(map[string]interface{}{
+				_ = json.NewEncoder(w).Encode(map[string]interface{}{
 					"error": map[string]string{
 						"code":    "session_expired",
 						"message": "Your session has expired. Please sign in again.",
@@ -642,6 +678,7 @@ func (ws *WebServer) sessionToBearerMiddleware(next http.Handler) http.Handler {
 // registerRoutes sets up the web server routes.
 func (ws *WebServer) registerRoutes() {
 	ws.mux.HandleFunc("/healthz", ws.handleHealthz)
+	ws.mux.HandleFunc("/health", ws.handleHealthz)
 	ws.mux.Handle("/assets/", ws.staticHandler())
 	ws.mux.Handle("/shoelace/", ws.staticHandler())
 	// Auth routes (no session auth required)
@@ -651,6 +688,8 @@ func (ws *WebServer) registerRoutes() {
 	ws.mux.HandleFunc("/auth/me", ws.handleAuthMe)
 	ws.mux.HandleFunc("/auth/providers", ws.handleAuthProviders)
 	ws.mux.HandleFunc("/auth/debug", ws.handleAuthDebug)
+	// Test-login endpoint for integration testing (gated by EnableTestLogin)
+	ws.mux.HandleFunc("/api/v1/auth/test-login", ws.handleTestLogin)
 	// SSE event stream (protected by session auth middleware)
 	ws.mux.HandleFunc("/events", ws.handleSSE)
 	// SPA catch-all (protected by session auth middleware)
@@ -713,7 +752,7 @@ func (ws *WebServer) handleHealthz(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
-	json.NewEncoder(w).Encode(resp)
+	_ = json.NewEncoder(w).Encode(resp)
 }
 
 // staticHandler returns an http.Handler that serves static assets.
@@ -727,7 +766,10 @@ func (ws *WebServer) staticHandler() http.Handler {
 
 func (ws *WebServer) serveStaticAsset(w http.ResponseWriter, r *http.Request) {
 	if ws.assetsDisk == "" && ws.assets == nil {
-		http.Error(w, "no assets available", http.StatusNotFound)
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		w.Header().Set("Cache-Control", "no-cache")
+		w.WriteHeader(http.StatusNotFound)
+		_, _ = fmt.Fprint(w, noAssetsPage)
 		return
 	}
 
@@ -767,7 +809,7 @@ func isHashedAsset(path string) bool {
 		return false
 	}
 	for _, c := range hash {
-		if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')) {
+		if (c < '0' || c > '9') && (c < 'a' || c > 'f') && (c < 'A' || c > 'F') {
 			return false
 		}
 	}
@@ -790,6 +832,10 @@ func resolveAPIPath(urlPath string) string {
 		return "/api/v1" + p
 	case strings.HasPrefix(p, "/projects/") && strings.Count(p, "/") == 2:
 		// /projects/{id} -> /api/v1/projects/{id}
+		return "/api/v1" + p
+	case p == "/skills":
+		return "/api/v1/skills"
+	case strings.HasPrefix(p, "/skills/") && strings.Count(p, "/") == 2:
 		return "/api/v1" + p
 	default:
 		return ""
@@ -896,7 +942,7 @@ func (ws *WebServer) spaHandler() http.HandlerFunc {
 			w.Header().Set("Content-Type", "text/html; charset=utf-8")
 			w.Header().Set("Cache-Control", "no-cache")
 			w.WriteHeader(http.StatusOK)
-			fmt.Fprint(w, noAssetsPage)
+			_, _ = fmt.Fprint(w, noAssetsPage)
 			return
 		}
 
@@ -942,7 +988,7 @@ func (ws *WebServer) tryServeStaticFile(w http.ResponseWriter, r *http.Request) 
 		if err != nil {
 			return false
 		}
-		f.Close()
+		_ = f.Close()
 	} else {
 		return false
 	}
@@ -952,7 +998,7 @@ func (ws *WebServer) tryServeStaticFile(w http.ResponseWriter, r *http.Request) 
 }
 
 // handleSSE serves the Server-Sent Events endpoint. It subscribes to the
-// in-process ChannelEventPublisher and streams matching events to the browser.
+// configured EventPublisher and streams matching events to the browser.
 // Route: GET /events?sub=<pattern>&sub=<pattern>...
 func (ws *WebServer) handleSSE(w http.ResponseWriter, r *http.Request) {
 	if ws.events == nil {
@@ -1011,11 +1057,11 @@ func (ws *WebServer) handleSSE(w http.ResponseWriter, r *http.Request) {
 			//   data: {"subject":"project.xxx.agent.created","data":{...}}
 			// The client's SSEClient listens for event type "update" and
 			// the StateManager parses the subject to route the event.
-			fmt.Fprintf(w, "id: %d\nevent: update\ndata: {\"subject\":%q,\"data\":%s}\n\n",
+			_, _ = fmt.Fprintf(w, "id: %d\nevent: update\ndata: {\"subject\":%q,\"data\":%s}\n\n",
 				eventID, evt.Subject, evt.Data)
 			flusher.Flush()
 		case <-heartbeat.C:
-			fmt.Fprintf(w, ":heartbeat %d\n\n", time.Now().UnixMilli())
+			_, _ = fmt.Fprintf(w, ":heartbeat %d\n\n", time.Now().UnixMilli())
 			flusher.Flush()
 		case <-r.Context().Done():
 			return
@@ -1069,7 +1115,7 @@ func isAllowedSubjectChar(c rune) bool {
 // isPublicRoute returns true for routes that do not require authentication.
 func isPublicRoute(path string) bool {
 	switch {
-	case path == "/healthz":
+	case path == "/healthz" || path == "/health":
 		return true
 	case strings.HasPrefix(path, "/assets/"):
 		return true
@@ -1138,11 +1184,24 @@ func (ws *WebServer) devAuthMiddleware(next http.Handler) http.Handler {
 			return
 		}
 
-		// No user — auto-login with dev identity
+		// No user — auto-login with dev identity.
+		// Read from the store so any identity set via the onboarding wizard is reflected.
+		devEmail := "dev@localhost"
+		devName := "Development User"
+		if ws.store != nil {
+			if dbUser, err := ws.store.GetUser(r.Context(), DevUserID); err == nil {
+				if dbUser.Email != "" {
+					devEmail = dbUser.Email
+				}
+				if dbUser.DisplayName != "" {
+					devName = dbUser.DisplayName
+				}
+			}
+		}
 		devUser := &webSessionUser{
 			UserID:    DevUserID,
-			Email:     "dev@localhost",
-			Name:      "Development User",
+			Email:     devEmail,
+			Name:      devName,
 			AvatarURL: "",
 			Role:      "admin",
 		}
@@ -1224,7 +1283,7 @@ func (ws *WebServer) sessionAuthMiddleware(next http.Handler) http.Handler {
 		// Non-browser request: return 401 JSON
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusUnauthorized)
-		json.NewEncoder(w).Encode(map[string]string{
+		_ = json.NewEncoder(w).Encode(map[string]string{
 			"error": "authentication required",
 		})
 	})
@@ -1447,8 +1506,26 @@ func (ws *WebServer) handleOAuthCallback(w http.ResponseWriter, r *http.Request)
 }
 
 // handleLogout clears the session and redirects to login (or returns JSON for API).
+// In proxy mode, logout is a no-op (the proxy owns the session) — optionally
+// redirect to IAP's clear_login_cookie endpoint.
 // Route: GET /auth/logout, POST /auth/logout
 func (ws *WebServer) handleLogout(w http.ResponseWriter, r *http.Request) {
+	// In proxy mode, the hub does not own the session.
+	if ws.config.AuthMode == "proxy" {
+		if isBrowserRequest(r) {
+			// Redirect to IAP's clear login cookie endpoint
+			http.Redirect(w, r, "/_gcp_iap/clear_login_cookie", http.StatusFound)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			"success": true,
+			"message": "proxy mode: session is managed by the authenticating proxy",
+		})
+		return
+	}
+
 	session, err := ws.sessionStore.Get(r, webSessionName)
 	if err != nil {
 		session, _ = ws.sessionStore.New(r, webSessionName)
@@ -1470,7 +1547,7 @@ func (ws *WebServer) handleLogout(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
-	json.NewEncoder(w).Encode(map[string]bool{"success": true})
+	_ = json.NewEncoder(w).Encode(map[string]bool{"success": true})
 }
 
 // handleAuthMe returns the current user from the session as JSON.
@@ -1479,7 +1556,7 @@ func (ws *WebServer) handleAuthMe(w http.ResponseWriter, r *http.Request) {
 	// Check context first (set by devAuthMiddleware or sessionAuthMiddleware)
 	if user := getWebSessionUser(r.Context()); user != nil {
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(user)
+		_ = json.NewEncoder(w).Encode(user)
 		return
 	}
 
@@ -1488,7 +1565,7 @@ func (ws *WebServer) handleAuthMe(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusUnauthorized)
-		json.NewEncoder(w).Encode(map[string]string{"error": "authentication required"})
+		_ = json.NewEncoder(w).Encode(map[string]string{"error": "authentication required"})
 		return
 	}
 
@@ -1496,7 +1573,7 @@ func (ws *WebServer) handleAuthMe(w http.ResponseWriter, r *http.Request) {
 	if !ok || uid == "" {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusUnauthorized)
-		json.NewEncoder(w).Encode(map[string]string{"error": "authentication required"})
+		_ = json.NewEncoder(w).Encode(map[string]string{"error": "authentication required"})
 		return
 	}
 
@@ -1509,22 +1586,25 @@ func (ws *WebServer) handleAuthMe(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(user)
+	_ = json.NewEncoder(w).Encode(user)
 }
 
 // handleAuthProviders returns which OAuth providers are enabled for web login.
 // Route: GET /auth/providers
 func (ws *WebServer) handleAuthProviders(w http.ResponseWriter, r *http.Request) {
-	resp := map[string]bool{
+	resp := map[string]interface{}{
 		"google": false,
 		"github": false,
 	}
-	if ws.oauthService != nil {
+	// In proxy mode, no OAuth providers are active (auth is handled by the proxy).
+	if ws.config.AuthMode == "proxy" {
+		resp["authMode"] = "proxy"
+	} else if ws.oauthService != nil {
 		resp["google"] = ws.oauthService.IsProviderConfiguredForClient(OAuthClientTypeWeb, "google")
 		resp["github"] = ws.oauthService.IsProviderConfiguredForClient(OAuthClientTypeWeb, "github")
 	}
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(resp)
+	_ = json.NewEncoder(w).Encode(resp)
 }
 
 // handleAuthDebug returns session debug info (debug mode only).
@@ -1546,6 +1626,7 @@ func (ws *WebServer) handleAuthDebug(w http.ResponseWriter, r *http.Request) {
 		"hasAccessToken": session.Values[sessKeyHubAccessToken] != nil,
 		"config": map[string]interface{}{
 			"baseURL":         ws.config.BaseURL,
+			"authMode":        ws.config.AuthMode,
 			"devAuthEnabled":  ws.config.DevAuthToken != "",
 			"oauthConfigured": ws.oauthService != nil,
 			"storeConfigured": ws.store != nil,
@@ -1561,7 +1642,7 @@ func (ws *WebServer) handleAuthDebug(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(debug)
+	_ = json.NewEncoder(w).Encode(debug)
 }
 
 // sessionString is a helper to safely extract a string from session values.
@@ -1581,7 +1662,7 @@ func (ws *WebServer) securityHeadersMiddleware(next http.Handler) http.Handler {
 		"style-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net https://cdn.webawesome.com https://fonts.googleapis.com",
 		"font-src 'self' https://fonts.gstatic.com https://cdn.jsdelivr.net https://cdn.webawesome.com",
 		"img-src 'self' data: https:",
-		"connect-src 'self' data: ws: wss: http://localhost:* http://127.0.0.1:*",
+		"connect-src 'self' data: ws: wss: http://localhost:* http://127.0.0.1:* https://storage.googleapis.com",
 	}, "; ")
 
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -1652,6 +1733,7 @@ func (ws *WebServer) Start(ctx context.Context) error {
 
 	// Wrap the handler with h2c to support HTTP/2 cleartext upgrades.
 	h2s := &http2.Server{}
+	//nolint:staticcheck // h2c remains intentional for cleartext local deployments.
 	h2cHandler := h2c.NewHandler(handler, h2s)
 
 	ws.httpServer = &http.Server{

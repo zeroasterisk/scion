@@ -82,7 +82,7 @@ var harnessConfigListCmd = &cobra.Command{
 		// Include Hub results if requested
 		if showHub {
 			hubCtx, err := CheckHubAvailabilityWithOptions(gp, true)
-			if err == nil {
+			if err == nil && hubCtx != nil {
 				hubResp, err := hubCtx.Client.HarnessConfigs().List(context.Background(), &hubclient.ListHarnessConfigsOptions{
 					Status: "active",
 				})
@@ -163,13 +163,12 @@ This overwrites config.yaml and home directory files with the built-in versions.
 			return fmt.Errorf("harness-config %q not found at %s: %w", name, targetDir, err)
 		}
 
-		// Reset always seeds from the built-in defaults of the underlying
-		// harness type, so use the legacy New() shim here rather than
-		// Resolve(); the latter would dispatch container-script when
-		// activated, but reset must restore the embedded built-in fileset.
 		h := harness.New(hcDir.Config.Harness)
 
-		// Reset by re-seeding with force=true
+		if _, basePath := h.GetHarnessEmbedsFS(); basePath == "" {
+			return fmt.Errorf("cannot reset %q: it is installed from a bundle and has no built-in defaults; reinstall with: scion harness-config install harnesses/%s", name, hcDir.Config.Harness)
+		}
+
 		if err := config.SeedHarnessConfig(targetDir, h, true); err != nil {
 			return fmt.Errorf("failed to reset harness-config %q: %w", name, err)
 		}
@@ -297,6 +296,9 @@ var harnessConfigSyncCmd = &cobra.Command{
 		if err != nil {
 			return err
 		}
+		if hubCtx == nil {
+			return fmt.Errorf("Hub integration is not enabled. Configure via 'scion config set hub.enabled true' and 'scion config set hub.endpoint <url>'")
+		}
 
 		PrintUsingHub(hubCtx.Endpoint)
 
@@ -338,6 +340,9 @@ var harnessConfigPullCmd = &cobra.Command{
 		hubCtx, err := CheckHubAvailabilityWithOptions(gp, true)
 		if err != nil {
 			return err
+		}
+		if hubCtx == nil {
+			return fmt.Errorf("Hub integration is not enabled. Configure via 'scion config set hub.enabled true' and 'scion config set hub.endpoint <url>'")
 		}
 
 		PrintUsingHub(hubCtx.Endpoint)
@@ -414,31 +419,34 @@ var harnessConfigShowCmd = &cobra.Command{
 			return fmt.Errorf("harness-config %q not found locally and Hub unavailable: %w", name, err)
 		}
 
-		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-		defer cancel()
+		if hubCtx != nil {
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
 
-		resp, err := hubCtx.Client.HarnessConfigs().List(ctx, &hubclient.ListHarnessConfigsOptions{
-			Name:   name,
-			Status: "active",
-		})
-		if err != nil {
-			return fmt.Errorf("failed to search Hub: %w", err)
-		}
-
-		for _, hc := range resp.HarnessConfigs {
-			if hc.Name == name || hc.Slug == name {
-				if isJSONOutput() {
-					return outputJSON(hc)
+			resp, err := hubCtx.Client.HarnessConfigs().List(ctx, &hubclient.ListHarnessConfigsOptions{
+				Name:   name,
+				Status: "active",
+			})
+			if err == nil {
+				for _, hc := range resp.HarnessConfigs {
+					if hc.Name == name || hc.Slug == name {
+						if isJSONOutput() {
+							return outputJSON(hc)
+						}
+						fmt.Printf("Name:         %s\n", hc.Name)
+						fmt.Printf("Source:       hub\n")
+						fmt.Printf("ID:           %s\n", hc.ID)
+						fmt.Printf("Harness:      %s\n", hc.Harness)
+						fmt.Printf("Status:       %s\n", hc.Status)
+						fmt.Printf("Content Hash: %s\n", truncateHash(hc.ContentHash))
+						fmt.Printf("Scope:        %s\n", hc.Scope)
+						fmt.Printf("Files:        %d\n", len(hc.Files))
+						if hc.SourceURL != "" {
+							fmt.Printf("Source URL:   %s\n", hc.SourceURL)
+						}
+						return nil
+					}
 				}
-				fmt.Printf("Name:         %s\n", hc.Name)
-				fmt.Printf("Source:       hub\n")
-				fmt.Printf("ID:           %s\n", hc.ID)
-				fmt.Printf("Harness:      %s\n", hc.Harness)
-				fmt.Printf("Status:       %s\n", hc.Status)
-				fmt.Printf("Content Hash: %s\n", truncateHash(hc.ContentHash))
-				fmt.Printf("Scope:        %s\n", hc.Scope)
-				fmt.Printf("Files:        %d\n", len(hc.Files))
-				return nil
 			}
 		}
 
@@ -466,6 +474,9 @@ var harnessConfigDeleteCmd = &cobra.Command{
 		hubCtx, err := CheckHubAvailabilityWithOptions(gp, true)
 		if err != nil {
 			return err
+		}
+		if hubCtx == nil {
+			return fmt.Errorf("Hub integration is not enabled. Configure via 'scion config set hub.enabled true' and 'scion config set hub.endpoint <url>'")
 		}
 
 		PrintUsingHub(hubCtx.Endpoint)
@@ -826,6 +837,7 @@ func init() {
 	harnessConfigCmd.AddCommand(harnessConfigShowCmd)
 	harnessConfigCmd.AddCommand(harnessConfigDeleteCmd)
 	harnessConfigCmd.AddCommand(harnessConfigInstallCmd)
+	harnessConfigCmd.AddCommand(harnessConfigUpdateCmd)
 
 	// Flags for list command
 	harnessConfigListCmd.Flags().Bool("hub", false, "Include Hub results")

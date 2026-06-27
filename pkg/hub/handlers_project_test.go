@@ -44,32 +44,79 @@ func TestHubManagedProjectPath(t *testing.T) {
 	homeDir, err := os.UserHomeDir()
 	require.NoError(t, err)
 
+	// Default (no content in either dir) should resolve to projects/
 	expected := filepath.Join(homeDir, ".scion", "projects", "my-test-project")
 	assert.Equal(t, expected, path)
 }
 
-func TestHubManagedProjectPath_EmptyProjectsFallsBackToGroves(t *testing.T) {
-	// Use a temp directory as HOME to avoid polluting real ~/.scion
+func TestHubManagedProjectPath_PrefersProjectsOverGroves(t *testing.T) {
 	tmpHome := t.TempDir()
 	t.Setenv("HOME", tmpHome)
 
-	slug := "empty-projects-grove"
+	slug := "both-dirs-exist"
 	globalDir := filepath.Join(tmpHome, ".scion")
 
-	// Create projects/{slug} with only infrastructure dirs (no real content)
+	// Create both directories with workspace content
 	projectsDir := filepath.Join(globalDir, "projects", slug)
-	require.NoError(t, os.MkdirAll(filepath.Join(projectsDir, "shared-dirs"), 0755))
-	require.NoError(t, os.MkdirAll(filepath.Join(projectsDir, ".scion"), 0755))
+	require.NoError(t, os.MkdirAll(projectsDir, 0755))
+	require.NoError(t, os.WriteFile(filepath.Join(projectsDir, "metadata.json"), []byte("{}"), 0644))
 
-	// Create groves/{slug} with actual workspace content
 	grovesDir := filepath.Join(globalDir, "groves", slug)
 	require.NoError(t, os.MkdirAll(grovesDir, 0755))
 	require.NoError(t, os.WriteFile(filepath.Join(grovesDir, "README.md"), []byte("# workspace"), 0644))
 
-	// hubManagedProjectPath should fall back to groves/ since projects/ has no real content
+	// hubManagedProjectPath should prefer projects/ over legacy groves/
 	path, err := hubManagedProjectPath(slug)
 	require.NoError(t, err)
-	assert.Equal(t, grovesDir, path, "should fall back to groves path when projects dir only contains infrastructure dirs")
+	assert.Equal(t, projectsDir, path, "should prefer projects path over groves path")
+}
+
+func TestHubManagedProjectPath_FallsBackToGrovesWhenProjectsEmpty(t *testing.T) {
+	tmpHome := t.TempDir()
+	t.Setenv("HOME", tmpHome)
+
+	slug := "projects-empty-groves-has-content"
+	globalDir := filepath.Join(tmpHome, ".scion")
+
+	// Create projects/{slug} with only infrastructure dirs (no real content)
+	projectsDir := filepath.Join(globalDir, "projects", slug)
+	require.NoError(t, os.MkdirAll(filepath.Join(projectsDir, ".scion"), 0755))
+
+	// Create groves/{slug} with actual workspace content (legacy)
+	grovesDir := filepath.Join(globalDir, "groves", slug)
+	require.NoError(t, os.MkdirAll(grovesDir, 0755))
+	require.NoError(t, os.WriteFile(filepath.Join(grovesDir, "README.md"), []byte("# workspace"), 0644))
+
+	// hubManagedProjectPath should fall back to groves/ for backward compatibility
+	path, err := hubManagedProjectPath(slug)
+	require.NoError(t, err)
+	assert.Equal(t, grovesDir, path, "should fall back to legacy groves path when projects dir only contains infrastructure dirs")
+}
+
+func TestHubManagedProjectPath_DefaultsToProjectsWhenNeitherHasContent(t *testing.T) {
+	tmpHome := t.TempDir()
+	t.Setenv("HOME", tmpHome)
+
+	slug := "neither-has-content"
+	globalDir := filepath.Join(tmpHome, ".scion")
+
+	// Create both directories with only infrastructure dirs
+	grovesDir := filepath.Join(globalDir, "groves", slug)
+	require.NoError(t, os.MkdirAll(filepath.Join(grovesDir, ".scion"), 0755))
+
+	projectsDir := filepath.Join(globalDir, "projects", slug)
+	require.NoError(t, os.MkdirAll(filepath.Join(projectsDir, "shared-dirs"), 0755))
+
+	// When neither has content, should default to projects/
+	path, err := hubManagedProjectPath(slug)
+	require.NoError(t, err)
+	assert.Equal(t, projectsDir, path, "should default to projects path when neither dir has workspace content")
+}
+
+func TestHubManagedProjectPath_EmptySlug(t *testing.T) {
+	_, err := hubManagedProjectPath("")
+	require.Error(t, err, "empty slug should return an error")
+	assert.Contains(t, err.Error(), "slug must not be empty")
 }
 
 func TestCreateProject_HubManaged_NoGitRemote(t *testing.T) {
@@ -101,7 +148,7 @@ func TestCreateProject_HubManaged_NoGitRemote(t *testing.T) {
 
 	// Cleanup
 	t.Cleanup(func() {
-		os.RemoveAll(workspacePath)
+		_ = os.RemoveAll(workspacePath)
 	})
 }
 
@@ -133,7 +180,7 @@ func TestPopulateAgentConfig_HubManagedProject_SetsWorkspace(t *testing.T) {
 	srv, _ := testServer(t)
 
 	project := &store.Project{
-		ID:   "project-hub-managed",
+		ID:   tid("project-hub-managed"),
 		Name: "Hub Managed",
 		Slug: "hub-managed",
 		// No GitRemote — hub-managed project
@@ -183,7 +230,7 @@ func TestPopulateAgentConfig_GitProject_NoWorkspace(t *testing.T) {
 	srv, _ := testServer(t)
 
 	project := &store.Project{
-		ID:        "project-git",
+		ID:        tid("project-git"),
 		Name:      "Git Project",
 		Slug:      "git-project",
 		GitRemote: "github.com/test/repo",
@@ -210,8 +257,9 @@ func TestPopulateAgentConfig_StampsHarnessConfigID(t *testing.T) {
 	srv, st := testServer(t)
 	ctx := context.Background()
 
+	hcID := "a0000000-0000-0000-0000-000000000001"
 	hc := &store.HarnessConfig{
-		ID:          "hc-claude-1",
+		ID:          hcID,
 		Name:        "claude",
 		Slug:        "claude",
 		Harness:     "claude",
@@ -233,8 +281,8 @@ func TestPopulateAgentConfig_StampsHarnessConfigID(t *testing.T) {
 
 	srv.populateAgentConfig(ctx, agent, project, nil)
 
-	if agent.AppliedConfig.HarnessConfigID != "hc-claude-1" {
-		t.Errorf("expected HarnessConfigID 'hc-claude-1', got %q", agent.AppliedConfig.HarnessConfigID)
+	if agent.AppliedConfig.HarnessConfigID != hcID {
+		t.Errorf("expected HarnessConfigID %q, got %q", hcID, agent.AppliedConfig.HarnessConfigID)
 	}
 	if agent.AppliedConfig.HarnessConfigHash != "deadbeef" {
 		t.Errorf("expected HarnessConfigHash 'deadbeef', got %q", agent.AppliedConfig.HarnessConfigHash)
@@ -248,8 +296,9 @@ func TestPopulateAgentConfig_HarnessConfigFromTemplateDefault(t *testing.T) {
 	srv, st := testServer(t)
 	ctx := context.Background()
 
+	hcID := "b0000000-0000-0000-0000-000000000002"
 	hc := &store.HarnessConfig{
-		ID:          "hc-web-1",
+		ID:          hcID,
 		Name:        "claude-web",
 		Slug:        "claude-web",
 		Harness:     "claude",
@@ -270,8 +319,8 @@ func TestPopulateAgentConfig_HarnessConfigFromTemplateDefault(t *testing.T) {
 
 	srv.populateAgentConfig(ctx, agent, project, template)
 
-	if agent.AppliedConfig.HarnessConfigID != "hc-web-1" {
-		t.Errorf("expected HarnessConfigID 'hc-web-1' from template default, got %q", agent.AppliedConfig.HarnessConfigID)
+	if agent.AppliedConfig.HarnessConfigID != hcID {
+		t.Errorf("expected HarnessConfigID %q from template default, got %q", hcID, agent.AppliedConfig.HarnessConfigID)
 	}
 	if agent.AppliedConfig.HarnessConfigHash != "cafef00d" {
 		t.Errorf("expected HarnessConfigHash 'cafef00d', got %q", agent.AppliedConfig.HarnessConfigHash)
@@ -517,7 +566,7 @@ func TestCreateAgent_HubManagedProject_ExplicitBroker_AutoLinks(t *testing.T) {
 
 	// Create a runtime broker
 	broker := &store.RuntimeBroker{
-		ID:     "broker-hub-autolink",
+		ID:     tid("broker-hub-autolink"),
 		Slug:   "hub-autolink-broker",
 		Name:   "Hub Autolink Broker",
 		Status: store.BrokerStatusOnline,
@@ -526,7 +575,7 @@ func TestCreateAgent_HubManagedProject_ExplicitBroker_AutoLinks(t *testing.T) {
 
 	// Create a hub-managed project (no git remote, no default broker, no providers)
 	project := &store.Project{
-		ID:   "project-hub-autolink",
+		ID:   tid("project-hub-autolink"),
 		Slug: "hub-autolink",
 		Name: "Hub Autolink Project",
 		// No GitRemote — hub-managed
@@ -572,7 +621,7 @@ func TestCreateProject_HubManaged_AutoProvide(t *testing.T) {
 
 	// Create a broker with auto_provide enabled
 	broker := &store.RuntimeBroker{
-		ID:          "broker-autoprovide",
+		ID:          tid("broker-autoprovide"),
 		Slug:        "autoprovide-broker",
 		Name:        "Auto Provide Broker",
 		Status:      store.BrokerStatusOnline,
@@ -619,7 +668,7 @@ func TestCreateProject_HubManaged_AutoProvide(t *testing.T) {
 	// Cleanup hub-managed project filesystem
 	workspacePath, err := hubManagedProjectPath(project.Slug)
 	if err == nil {
-		t.Cleanup(func() { os.RemoveAll(workspacePath) })
+		t.Cleanup(func() { _ = os.RemoveAll(workspacePath) })
 	}
 }
 
@@ -673,15 +722,15 @@ func TestDeleteProject_DeleteAgents_DispatchesToBroker(t *testing.T) {
 	disp := &deleteDispatcher{}
 	srv.SetDispatcher(disp)
 
-	project, _, _ := setupOnlineBrokerAgent(t, s, "project-del")
+	project, broker, agent1 := setupOnlineBrokerAgent(t, s, "project-del")
 
 	// Create a second agent in the same project
 	agent2 := &store.Agent{
-		ID:              "agent-online-project-del-2",
+		ID:              tid("agent-online-project-del-2"),
 		Slug:            "agent-online-project-del-2-slug",
 		Name:            "Agent Online project-del 2",
 		ProjectID:       project.ID,
-		RuntimeBrokerID: "broker-online-project-del",
+		RuntimeBrokerID: broker.ID,
 		Phase:           string(state.PhaseRunning),
 	}
 	require.NoError(t, s.CreateAgent(ctx, agent2))
@@ -700,7 +749,7 @@ func TestDeleteProject_DeleteAgents_DispatchesToBroker(t *testing.T) {
 	assert.ErrorIs(t, err, store.ErrNotFound)
 
 	// Verify agents cascade-deleted from database
-	_, err = s.GetAgent(ctx, "agent-online-project-del")
+	_, err = s.GetAgent(ctx, agent1.ID)
 	assert.ErrorIs(t, err, store.ErrNotFound)
 	_, err = s.GetAgent(ctx, agent2.ID)
 	assert.ErrorIs(t, err, store.ErrNotFound)
@@ -734,7 +783,7 @@ func TestCreateAgent_HubManagedProject_NoProviders_NoBroker(t *testing.T) {
 
 	// Create a hub-managed project with no providers
 	project := &store.Project{
-		ID:   "project-hub-noproviders",
+		ID:   tid("project-hub-noproviders"),
 		Slug: "hub-noproviders",
 		Name: "No Providers Project",
 	}
@@ -761,7 +810,7 @@ func TestAutoLinkProviders_HubManagedProject_NoLocalPath(t *testing.T) {
 
 	// Create a broker with auto_provide enabled
 	broker := &store.RuntimeBroker{
-		ID:          "broker-localpath-auto",
+		ID:          tid("broker-localpath-auto"),
 		Slug:        "localpath-auto-broker",
 		Name:        "LocalPath Auto Broker",
 		Status:      store.BrokerStatusOnline,
@@ -791,7 +840,7 @@ func TestAutoLinkProviders_HubManagedProject_NoLocalPath(t *testing.T) {
 	// Cleanup hub-managed project filesystem
 	workspacePath, err := hubManagedProjectPath(project.Slug)
 	if err == nil {
-		t.Cleanup(func() { os.RemoveAll(workspacePath) })
+		t.Cleanup(func() { _ = os.RemoveAll(workspacePath) })
 	}
 }
 
@@ -803,7 +852,7 @@ func TestAutoLinkProviders_GitProject_NoLocalPath(t *testing.T) {
 
 	// Create a broker with auto_provide enabled
 	broker := &store.RuntimeBroker{
-		ID:          "broker-localpath-git",
+		ID:          tid("broker-localpath-git"),
 		Slug:        "localpath-git-broker",
 		Name:        "LocalPath Git Broker",
 		Status:      store.BrokerStatusOnline,
@@ -839,7 +888,7 @@ func TestDeleteProject_HubManaged_DispatchesCleanupToBrokers(t *testing.T) {
 
 	// Create a hub-managed project
 	project := &store.Project{
-		ID:   "project-cleanup-dispatch",
+		ID:   tid("project-cleanup-dispatch"),
 		Slug: "cleanup-dispatch",
 		Name: "Cleanup Dispatch Project",
 		// No GitRemote — hub-managed
@@ -848,14 +897,14 @@ func TestDeleteProject_HubManaged_DispatchesCleanupToBrokers(t *testing.T) {
 
 	// Create two brokers
 	broker1 := &store.RuntimeBroker{
-		ID:       "broker-cleanup-1",
+		ID:       tid("broker-cleanup-1"),
 		Slug:     "cleanup-broker-1",
 		Name:     "Cleanup Broker 1",
 		Status:   store.BrokerStatusOnline,
 		Endpoint: "http://broker1:9800",
 	}
 	broker2 := &store.RuntimeBroker{
-		ID:       "broker-cleanup-2",
+		ID:       tid("broker-cleanup-2"),
 		Slug:     "cleanup-broker-2",
 		Name:     "Cleanup Broker 2",
 		Status:   store.BrokerStatusOnline,
@@ -866,14 +915,16 @@ func TestDeleteProject_HubManaged_DispatchesCleanupToBrokers(t *testing.T) {
 
 	// Link both as providers
 	require.NoError(t, s.AddProjectProvider(ctx, &store.ProjectProvider{
-		ProjectID: project.ID,
-		BrokerID:  broker1.ID,
-		LinkedBy:  "test",
+		ProjectID:  project.ID,
+		BrokerID:   broker1.ID,
+		BrokerName: broker1.Name,
+		LinkedBy:   "test",
 	}))
 	require.NoError(t, s.AddProjectProvider(ctx, &store.ProjectProvider{
-		ProjectID: project.ID,
-		BrokerID:  broker2.ID,
-		LinkedBy:  "test",
+		ProjectID:  project.ID,
+		BrokerID:   broker2.ID,
+		BrokerName: broker2.Name,
+		LinkedBy:   "test",
 	}))
 
 	// Set up a mock client and dispatcher
@@ -902,7 +953,7 @@ func TestDeleteProject_HubManaged_SkipsEmbeddedBroker(t *testing.T) {
 
 	// Create a hub-managed project
 	project := &store.Project{
-		ID:   "project-cleanup-embedded",
+		ID:   tid("project-cleanup-embedded"),
 		Slug: "cleanup-embedded",
 		Name: "Cleanup Embedded Project",
 	}
@@ -910,14 +961,14 @@ func TestDeleteProject_HubManaged_SkipsEmbeddedBroker(t *testing.T) {
 
 	// Create embedded and remote brokers
 	embeddedBroker := &store.RuntimeBroker{
-		ID:       "broker-embedded",
+		ID:       tid("broker-embedded"),
 		Slug:     "embedded-broker",
 		Name:     "Embedded Broker",
 		Status:   store.BrokerStatusOnline,
 		Endpoint: "http://localhost:9800",
 	}
 	remoteBroker := &store.RuntimeBroker{
-		ID:       "broker-remote",
+		ID:       tid("broker-remote"),
 		Slug:     "remote-broker",
 		Name:     "Remote Broker",
 		Status:   store.BrokerStatusOnline,
@@ -928,14 +979,16 @@ func TestDeleteProject_HubManaged_SkipsEmbeddedBroker(t *testing.T) {
 
 	// Link both as providers
 	require.NoError(t, s.AddProjectProvider(ctx, &store.ProjectProvider{
-		ProjectID: project.ID,
-		BrokerID:  embeddedBroker.ID,
-		LinkedBy:  "test",
+		ProjectID:  project.ID,
+		BrokerID:   embeddedBroker.ID,
+		BrokerName: embeddedBroker.Name,
+		LinkedBy:   "test",
 	}))
 	require.NoError(t, s.AddProjectProvider(ctx, &store.ProjectProvider{
-		ProjectID: project.ID,
-		BrokerID:  remoteBroker.ID,
-		LinkedBy:  "test",
+		ProjectID:  project.ID,
+		BrokerID:   remoteBroker.ID,
+		BrokerName: remoteBroker.Name,
+		LinkedBy:   "test",
 	}))
 
 	// Mark embedded broker
@@ -963,7 +1016,7 @@ func TestDeleteProject_GitBacked_NoCleanupDispatched(t *testing.T) {
 
 	// Create a git-backed project
 	project := &store.Project{
-		ID:        "project-git-nocleanup",
+		ID:        tid("project-git-nocleanup"),
 		Slug:      "git-nocleanup",
 		Name:      "Git No Cleanup Project",
 		GitRemote: "github.com/test/nocleanup",
@@ -972,7 +1025,7 @@ func TestDeleteProject_GitBacked_NoCleanupDispatched(t *testing.T) {
 
 	// Create a broker and link as provider
 	broker := &store.RuntimeBroker{
-		ID:       "broker-git-nocleanup",
+		ID:       tid("broker-git-nocleanup"),
 		Slug:     "git-nocleanup-broker",
 		Name:     "Git NoCleanup Broker",
 		Status:   store.BrokerStatusOnline,
@@ -980,9 +1033,10 @@ func TestDeleteProject_GitBacked_NoCleanupDispatched(t *testing.T) {
 	}
 	require.NoError(t, s.CreateRuntimeBroker(ctx, broker))
 	require.NoError(t, s.AddProjectProvider(ctx, &store.ProjectProvider{
-		ProjectID: project.ID,
-		BrokerID:  broker.ID,
-		LinkedBy:  "test",
+		ProjectID:  project.ID,
+		BrokerID:   broker.ID,
+		BrokerName: broker.Name,
+		LinkedBy:   "test",
 	}))
 
 	// Set up mock client and dispatcher
@@ -1007,7 +1061,7 @@ func TestResolveRuntimeBroker_HubManagedProject_NoLocalPath(t *testing.T) {
 
 	// Create a runtime broker (not auto-provide — will be explicitly selected)
 	broker := &store.RuntimeBroker{
-		ID:     "broker-resolve-localpath",
+		ID:     tid("broker-resolve-localpath"),
 		Slug:   "resolve-localpath-broker",
 		Name:   "Resolve LocalPath Broker",
 		Status: store.BrokerStatusOnline,
@@ -1016,7 +1070,7 @@ func TestResolveRuntimeBroker_HubManagedProject_NoLocalPath(t *testing.T) {
 
 	// Create a hub-managed project with no providers
 	project := &store.Project{
-		ID:   "project-resolve-localpath",
+		ID:   tid("project-resolve-localpath"),
 		Slug: "resolve-localpath",
 		Name: "Resolve LocalPath Project",
 	}
@@ -1050,7 +1104,7 @@ func TestProjectRegisterPreservesProviderLocalPath(t *testing.T) {
 
 	// Create a broker
 	broker := &store.RuntimeBroker{
-		ID:     "broker-preserve-path",
+		ID:     tid("broker-preserve-path"),
 		Name:   "Preserve Path Broker",
 		Slug:   "preserve-path-broker",
 		Status: store.BrokerStatusOnline,
@@ -1298,7 +1352,7 @@ func TestDeleteProject_CleansUpProjectConfigsDir(t *testing.T) {
 	require.NoError(t, os.MkdirAll(agentsDir, 0755))
 
 	projectConfigDir := filepath.Dir(extPath)
-	t.Cleanup(func() { os.RemoveAll(projectConfigDir) })
+	t.Cleanup(func() { _ = os.RemoveAll(projectConfigDir) })
 
 	// Verify directory exists before deletion
 	_, err = os.Stat(projectConfigDir)
@@ -1355,13 +1409,16 @@ func TestProjectRegister_ExistingProject_CreatesMembershipGroup(t *testing.T) {
 	ctx := context.Background()
 
 	// Create a project directly in the store (simulating one created before
-	// membership group support was added — no group exists yet).
+	// membership group support was added — no group exists yet). The creator is
+	// backfilled as a group owner, so it must reference an existing user.
+	creatorID := tid("original-creator-id")
+	permSeedUser(t, ctx, s, creatorID)
 	project := &store.Project{
 		ID:        api.NewUUID(),
 		Name:      "Pre-Existing Project",
 		Slug:      "pre-existing-project",
 		GitRemote: "github.com/test/pre-existing",
-		CreatedBy: "original-creator-id",
+		CreatedBy: creatorID,
 	}
 	require.NoError(t, s.CreateProject(ctx, project))
 
@@ -1396,7 +1453,7 @@ func TestProjectRegister_ExistingProject_CreatesMembershipGroup(t *testing.T) {
 			ownerIDs[m.MemberID] = true
 		}
 	}
-	assert.True(t, ownerIDs["original-creator-id"], "original creator should be an owner")
+	assert.True(t, ownerIDs[creatorID], "original creator should be an owner")
 	assert.True(t, ownerIDs[DevUserID], "linking user should be an owner")
 }
 
@@ -1444,7 +1501,7 @@ func TestCreateProject_SharedWorkspace_SetsLabelAndInitFilesystem(t *testing.T) 
 	// Verify workspace was cloned (it's a git repo)
 	workspacePath, err := hubManagedProjectPath(project.Slug)
 	require.NoError(t, err)
-	t.Cleanup(func() { os.RemoveAll(workspacePath) })
+	t.Cleanup(func() { _ = os.RemoveAll(workspacePath) })
 
 	assert.True(t, util.IsGitRepoDir(workspacePath), "workspace should be a git repo")
 
@@ -1473,11 +1530,50 @@ func TestCreateProject_PerAgentGit_NoWorkspaceLabel(t *testing.T) {
 	assert.False(t, project.IsSharedWorkspace())
 }
 
+func TestCreateProject_WorktreePerAgent_StampsLabel(t *testing.T) {
+	srv, _ := testServer(t)
+
+	body := CreateProjectRequest{
+		Name:          "Worktree Project",
+		GitRemote:     "github.com/test/worktree",
+		WorkspaceMode: "worktree-per-agent",
+	}
+
+	rec := doRequest(t, srv, http.MethodPost, "/api/v1/projects", body)
+	require.Equal(t, http.StatusCreated, rec.Code, "body: %s", rec.Body.String())
+
+	var project store.Project
+	require.NoError(t, json.NewDecoder(rec.Body).Decode(&project))
+
+	assert.Equal(t, store.WorkspaceModeWorktreePerAgent, project.Labels[store.LabelWorkspaceMode],
+		"worktree-per-agent label should be stamped")
+	assert.True(t, project.IsWorktreePerAgent(), "project should report as worktree-per-agent")
+	assert.False(t, project.IsSharedWorkspace(), "project should not report as shared workspace")
+}
+
+func TestCreateProject_WorktreePerAgent_NonGit_NoLabel(t *testing.T) {
+	srv, _ := testServer(t)
+
+	body := CreateProjectRequest{
+		Name:          "Non-Git Worktree",
+		WorkspaceMode: "worktree-per-agent",
+	}
+
+	rec := doRequest(t, srv, http.MethodPost, "/api/v1/projects", body)
+	require.Equal(t, http.StatusCreated, rec.Code, "body: %s", rec.Body.String())
+
+	var project store.Project
+	require.NoError(t, json.NewDecoder(rec.Body).Decode(&project))
+
+	assert.Empty(t, project.Labels[store.LabelWorkspaceMode],
+		"worktree-per-agent label should not be set on non-git projects")
+}
+
 func TestPopulateAgentConfig_SharedWorkspace_SetsWorkspaceNotClone(t *testing.T) {
 	srv, _ := testServer(t)
 
 	project := &store.Project{
-		ID:        "project-shared-ws",
+		ID:        tid("project-shared-ws"),
 		Name:      "Shared WS",
 		Slug:      "shared-ws",
 		GitRemote: "github.com/test/shared",
@@ -1559,6 +1655,35 @@ func TestPopulateAgentConfig_SharedWorkspace_DefaultsBranch(t *testing.T) {
 		"Branch should default to 'main' when no default-branch label is set")
 }
 
+func TestPopulateAgentConfig_WorktreePerAgent_SetsCloneNotWorkspace(t *testing.T) {
+	srv, _ := testServer(t)
+
+	project := &store.Project{
+		ID:        tid("project-wt"),
+		Name:      "Worktree Project",
+		Slug:      "worktree-proj",
+		GitRemote: "github.com/test/worktree",
+		Labels: map[string]string{
+			store.LabelWorkspaceMode:   store.WorkspaceModeWorktreePerAgent,
+			"scion.dev/default-branch": "main",
+		},
+	}
+
+	agent := &store.Agent{
+		ID:            "agent-worktree",
+		AppliedConfig: &store.AgentAppliedConfig{},
+	}
+
+	srv.populateAgentConfig(context.Background(), agent, project, nil)
+
+	assert.NotNil(t, agent.AppliedConfig.GitClone,
+		"GitClone should be set for worktree-per-agent projects (broker decides how to use it)")
+	assert.Contains(t, agent.AppliedConfig.GitClone.URL, "worktree",
+		"GitClone URL should reference the project remote")
+	assert.Empty(t, agent.AppliedConfig.Workspace,
+		"Workspace should NOT be set for worktree-per-agent projects")
+}
+
 func TestCloneSharedWorkspaceProject_Success(t *testing.T) {
 	srv, _ := testServer(t)
 
@@ -1593,7 +1718,7 @@ func TestCloneSharedWorkspaceProject_Success(t *testing.T) {
 	// Verify the workspace was created with a git repo
 	workspacePath, err := hubManagedProjectPath(project.Slug)
 	require.NoError(t, err)
-	t.Cleanup(func() { os.RemoveAll(workspacePath) })
+	t.Cleanup(func() { _ = os.RemoveAll(workspacePath) })
 
 	assert.True(t, util.IsGitRepoDir(workspacePath), "workspace should be a git repo")
 
@@ -1672,7 +1797,7 @@ func TestResolveCloneToken_FallsBackToCreatorUserToken(t *testing.T) {
 	ctx := context.Background()
 
 	require.NoError(t, st.CreateSecret(ctx, &store.Secret{
-		ID:             "sec-user-gh",
+		ID:             tid("sec-user-gh"),
 		Key:            "GITHUB_TOKEN",
 		EncryptedValue: "ghp_user_token_123",
 		SecretType:     store.SecretTypeEnvironment,
@@ -1699,7 +1824,7 @@ func TestResolveCloneToken_PrefersProjectTokenOverUserToken(t *testing.T) {
 	ctx := context.Background()
 
 	require.NoError(t, st.CreateSecret(ctx, &store.Secret{
-		ID:             "sec-project-gh",
+		ID:             tid("sec-project-gh"),
 		Key:            "GITHUB_TOKEN",
 		EncryptedValue: "ghp_project_token",
 		SecretType:     store.SecretTypeEnvironment,
@@ -1708,7 +1833,7 @@ func TestResolveCloneToken_PrefersProjectTokenOverUserToken(t *testing.T) {
 		ScopeID:        "project-with-both",
 	}))
 	require.NoError(t, st.CreateSecret(ctx, &store.Secret{
-		ID:             "sec-user-gh-2",
+		ID:             tid("sec-user-gh-2"),
 		Key:            "GITHUB_TOKEN",
 		EncryptedValue: "ghp_user_token",
 		SecretType:     store.SecretTypeEnvironment,
@@ -1778,7 +1903,7 @@ func TestCreateProject_AutoAssociatesGitHubInstallation(t *testing.T) {
 	// Clean up the cloned workspace
 	workspacePath, err := hubManagedProjectPath(project.Slug)
 	require.NoError(t, err)
-	t.Cleanup(func() { os.RemoveAll(workspacePath) })
+	t.Cleanup(func() { _ = os.RemoveAll(workspacePath) })
 
 	// Verify the project was auto-associated with the installation
 	updated, err := st.GetProject(ctx, project.ID)
@@ -1804,7 +1929,7 @@ func TestAutoAssociateGitHubInstallation_NoMatch(t *testing.T) {
 	require.NoError(t, st.CreateGitHubInstallation(ctx, inst))
 
 	project := &store.Project{
-		ID:        "project-no-match",
+		ID:        tid("project-no-match"),
 		Name:      "No Match",
 		Slug:      "no-match",
 		GitRemote: "github.com/myorg/myrepo",
@@ -1833,7 +1958,7 @@ func TestAutoAssociateGitHubInstallation_SkipsSuspended(t *testing.T) {
 	require.NoError(t, st.CreateGitHubInstallation(ctx, inst))
 
 	project := &store.Project{
-		ID:        "project-suspended",
+		ID:        tid("project-suspended"),
 		Name:      "Suspended",
 		Slug:      "suspended",
 		GitRemote: "github.com/myorg/myrepo",
@@ -1924,8 +2049,8 @@ func TestCreateProject_ListByGitRemote_ReturnsMultiple(t *testing.T) {
 
 	// Pre-create two projects for the same git remote.
 	for _, g := range []*store.Project{
-		{ID: "g1", Name: "widgets", Slug: "widgets", GitRemote: "github.com/acme/widgets"},
-		{ID: "g2", Name: "widgets (1)", Slug: "widgets-1", GitRemote: "github.com/acme/widgets"},
+		{ID: tid("g1"), Name: "widgets", Slug: "widgets", GitRemote: "github.com/acme/widgets"},
+		{ID: tid("g2"), Name: "widgets (1)", Slug: "widgets-1", GitRemote: "github.com/acme/widgets"},
 	} {
 		require.NoError(t, s.CreateProject(ctx, g))
 	}
@@ -1939,4 +2064,52 @@ func TestCreateProject_ListByGitRemote_ReturnsMultiple(t *testing.T) {
 	}
 	require.NoError(t, json.NewDecoder(rec.Body).Decode(&resp))
 	assert.Len(t, resp.Projects, 2, "listing by git remote should return all matching projects")
+}
+
+func TestProjectRouteDeprecationHeaders(t *testing.T) {
+	srv, _ := testServer(t)
+
+	canonical := doRequest(t, srv, http.MethodGet, "/api/v1/projects", nil)
+	require.Equal(t, http.StatusOK, canonical.Code, "body: %s", canonical.Body.String())
+	assert.Empty(t, canonical.Header().Get("Deprecation"))
+	assert.Empty(t, canonical.Header().Get("Sunset"))
+	assert.Empty(t, canonical.Header().Get("Link"))
+
+	legacy := doRequest(t, srv, http.MethodGet, "/api/v1/groves", nil)
+	require.Equal(t, http.StatusOK, legacy.Code, "body: %s", legacy.Body.String())
+	assert.Equal(t, "true", legacy.Header().Get("Deprecation"))
+	assert.Equal(t, legacyGroveRouteSunset, legacy.Header().Get("Sunset"))
+	assert.Contains(t, legacy.Header().Get("Link"), "/api/v1/projects/")
+}
+
+func TestRegisterProjectRequestLegacyIDAliases(t *testing.T) {
+	var legacyCamel RegisterProjectRequest
+	require.NoError(t, json.Unmarshal([]byte(`{"name":"Legacy","gitRemote":"github.com/acme/legacy","groveId":"legacy-camel"}`), &legacyCamel))
+	assert.Equal(t, "legacy-camel", legacyCamel.ID)
+
+	var legacySnake RegisterProjectRequest
+	require.NoError(t, json.Unmarshal([]byte(`{"name":"Legacy","gitRemote":"github.com/acme/legacy","grove_id":"legacy-snake"}`), &legacySnake))
+	assert.Equal(t, "legacy-snake", legacySnake.ID)
+
+	var canonicalWins RegisterProjectRequest
+	require.NoError(t, json.Unmarshal([]byte(`{"id":"canonical","name":"Canonical","gitRemote":"github.com/acme/canonical","groveId":"legacy"}`), &canonicalWins))
+	assert.Equal(t, "canonical", canonicalWins.ID)
+}
+
+func TestProjectRegisterAcceptsLegacyJSONID(t *testing.T) {
+	srv, _ := testServer(t)
+
+	body := map[string]interface{}{
+		"groveId":   tid("legacy_register_id"),
+		"gitRemote": "https://github.com/test/legacy-register.git",
+		"name":      "Legacy Register",
+	}
+
+	rec := doRequest(t, srv, http.MethodPost, "/api/v1/projects/register", body)
+	require.Equal(t, http.StatusOK, rec.Code, "body: %s", rec.Body.String())
+
+	var resp RegisterProjectResponse
+	require.NoError(t, json.NewDecoder(rec.Body).Decode(&resp))
+	require.NotNil(t, resp.Project)
+	assert.Equal(t, tid("legacy_register_id"), resp.Project.ID)
 }

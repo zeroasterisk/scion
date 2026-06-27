@@ -33,6 +33,7 @@ import (
 	"github.com/GoogleCloudPlatform/scion/pkg/gcp"
 	"github.com/GoogleCloudPlatform/scion/pkg/harness"
 	"github.com/GoogleCloudPlatform/scion/pkg/messages"
+	"github.com/GoogleCloudPlatform/scion/pkg/projectcompat"
 	scionrt "github.com/GoogleCloudPlatform/scion/pkg/runtime"
 	"github.com/GoogleCloudPlatform/scion/pkg/storage"
 	"github.com/GoogleCloudPlatform/scion/pkg/templatecache"
@@ -50,8 +51,9 @@ func matchesAgent(a api.AgentInfo, id, projectID string) bool {
 	if projectID == "" {
 		return true
 	}
-	// Check grove_id label first (authoritative), then ProjectID field
-	if labelProjectID := a.Labels["scion.grove_id"]; labelProjectID != "" {
+	// Check runtime labels first (canonical project_id, then legacy grove_id),
+	// then ProjectID field.
+	if labelProjectID := projectcompat.ProjectIDFromLabels(a.Labels); labelProjectID != "" {
 		return labelProjectID == projectID
 	}
 	if a.ProjectID != "" {
@@ -77,6 +79,11 @@ func (s *Server) GetHealthInfo(ctx context.Context) *HealthResponse {
 		checks[s.runtime.Name()] = "available"
 	} else {
 		checks["runtime"] = "unavailable"
+	}
+
+	// NFS mount health
+	if s.nfsMountReconciler != nil {
+		checks["nfs_mounts"] = s.nfsMountReconciler.HealthCheckString()
 	}
 
 	status := "healthy"
@@ -244,10 +251,7 @@ func (s *Server) listAgents(w http.ResponseWriter, r *http.Request) {
 	agentKey := func(a api.AgentInfo) string {
 		pid := a.ProjectID
 		if pid == "" {
-			pid = a.Labels["scion.project_id"]
-		}
-		if pid == "" {
-			pid = a.Labels["scion.grove_id"]
+			pid = projectcompat.ProjectIDFromLabels(a.Labels)
 		}
 		return a.Name + "\x00" + pid
 	}
@@ -561,6 +565,14 @@ func (s *Server) createAgent(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// N1-7: Ensure NFS shares are mounted before dispatch (no-op when backend=local).
+	if err := s.ensureNFSMountsReady(); err != nil {
+		markAttemptFailed(http.StatusServiceUnavailable, "NFS mount check failed: "+err.Error())
+		writeError(w, http.StatusServiceUnavailable, "nfs_unavailable",
+			"NFS workspace storage is not available: "+err.Error(), nil)
+		return
+	}
+
 	// Build unified start context (project path, env, template, git-clone, secrets, manager)
 	s.agentLifecycleLog.Info("Agent dispatch: pre-flight complete",
 		"agent_id", req.ID, "name", req.Name, "elapsed", time.Since(createStart).String())
@@ -580,7 +592,9 @@ func (s *Server) createAgent(w http.ResponseWriter, r *http.Request) {
 		CreatorName:     req.CreatorName,
 		ResolvedEnv:     req.ResolvedEnv,
 		ResolvedSecrets: req.ResolvedSecrets,
+		NoAuth:          req.NoAuth,
 		Attach:          req.Attach,
+		WorkspaceMode:   req.WorkspaceMode,
 		HTTPRequest:     r,
 	})
 	if err != nil {
@@ -662,6 +676,45 @@ func (s *Server) createAgent(w http.ResponseWriter, r *http.Request) {
 			if writeErr := config.WriteWorkspaceMarker(workspaceDir, req.ProjectID, req.ProjectSlug, req.ProjectSlug); writeErr != nil {
 				s.agentLifecycleLog.Warn("Failed to write workspace marker", "agent_id", req.ID, "project_id", req.ProjectID, "error", writeErr)
 			}
+		}
+	}
+
+	// Inject skill resolver from Hub connection for skill provisioning.
+	if conn := s.resolveHubConnection(r); conn != nil && conn.HubClient != nil {
+		hubResolver := agent.NewHubSkillResolver(conn.HubClient.Skills())
+		router := agent.NewRoutingSkillResolver(hubResolver)
+		ghResolver := agent.NewGitHubSkillResolver()
+		router.Register("gh", ghResolver)
+
+		// GCP resolver uses Hub API for registry alias lookup.
+		registrySvc := conn.HubClient.SkillRegistries()
+		gcpLookup := func(ctx context.Context, name string) (*agent.RegistryLookupResult, error) {
+			reg, err := registrySvc.Get(ctx, name)
+			if err != nil {
+				return nil, err
+			}
+			if reg == nil {
+				return nil, fmt.Errorf("registry %q not found", name)
+			}
+			return &agent.RegistryLookupResult{
+				Name:     reg.Name,
+				Endpoint: reg.Endpoint,
+				Type:     reg.Type,
+				Status:   reg.Status,
+			}, nil
+		}
+		router.Register("gcp-skill", agent.NewGCPSkillResolver(gcpLookup))
+
+		var resolver agent.SkillResolver = router
+		if s.skCache != nil {
+			resolver = agent.NewCachingSkillResolver(resolver, s.skCache)
+		}
+		ctx = agent.ContextWithSkillResolver(ctx, resolver)
+		if req.ProjectID != "" {
+			ctx = agent.ContextWithResolveProjectID(ctx, req.ProjectID)
+		}
+		if req.UserID != "" {
+			ctx = agent.ContextWithResolveUserID(ctx, req.UserID)
 		}
 	}
 
@@ -1099,6 +1152,8 @@ func (s *Server) handleAgentAction(w http.ResponseWriter, r *http.Request, id, p
 		s.sendMessage(w, r, id, projectID)
 	case api.AgentActionExec:
 		s.execCommand(w, r, id, projectID)
+	case api.AgentActionResetAuth:
+		s.resetAuth(w, r, id, projectID)
 	case api.AgentActionLogs:
 		s.getLogs(w, r, id, projectID)
 	case api.AgentActionStats:
@@ -1127,6 +1182,10 @@ func (s *Server) startAgent(w http.ResponseWriter, r *http.Request, id, projectI
 		// share a single git checkout instead of being given a worktree, and
 		// without this flag the broker would create a worktree on restart.
 		SharedWorkspace bool `json:"sharedWorkspace,omitempty"`
+		// Resume requests harness session continuation (e.g. Claude
+		// --continue). The hub is the source of truth and sets this from the
+		// agent's stored phase; when unset we fall back to GetSavedPhase below.
+		Resume bool `json:"resume,omitempty"`
 	}
 	if r.Body != nil && r.ContentLength != 0 {
 		if err := json.NewDecoder(r.Body).Decode(&startReq); err != nil {
@@ -1147,6 +1206,13 @@ func (s *Server) startAgent(w http.ResponseWriter, r *http.Request, id, projectI
 		}
 	}
 
+	// Parity with the create path: populate the dedicated AgentToken field from
+	// the hub-minted token in ResolvedEnv so buildStartContext treats it as an
+	// explicit token rather than relying on the resolvedEnv-kept fallback. The
+	// precedence in buildStartContext step 3 keeps this token regardless, but
+	// setting it here makes the start path behave like create.
+	startContextAgentToken := startReq.ResolvedEnv["SCION_AUTH_TOKEN"]
+
 	sc, err := s.buildStartContext(ctx, startContextInputs{
 		Name:            id,
 		ProjectPath:     startReq.ProjectPath,
@@ -1155,6 +1221,7 @@ func (s *Server) startAgent(w http.ResponseWriter, r *http.Request, id, projectI
 		ResolvedEnv:     startReq.ResolvedEnv,
 		ResolvedSecrets: startReq.ResolvedSecrets,
 		SharedDirs:      startReq.SharedDirs,
+		AgentToken:      startContextAgentToken,
 		HTTPRequest:     r,
 	})
 	if err != nil {
@@ -1190,8 +1257,13 @@ func (s *Server) startAgent(w http.ResponseWriter, r *http.Request, id, projectI
 		opts.Profile = agent.GetSavedProfile(id, opts.ProjectPath)
 	}
 
-	// If the agent was suspended, resume with harness session preservation.
-	if opts.ProjectPath != "" {
+	// The hub is the source of truth for resume intent: when it sets
+	// req.Resume the harness must continue its prior session. We still fall
+	// back to reading the saved phase from disk when the hub did not specify
+	// resume (e.g. the local CLI path, which does not send this flag).
+	if startReq.Resume {
+		opts.Resume = true
+	} else if opts.ProjectPath != "" {
 		savedPhase := agent.GetSavedPhase(id, opts.ProjectPath)
 		if savedPhase == string(state.PhaseSuspended) {
 			opts.Resume = true
@@ -1585,6 +1657,72 @@ func (s *Server) execCommand(w http.ResponseWriter, r *http.Request, id, project
 	writeJSON(w, http.StatusOK, ExecResponse{
 		Output:   output,
 		ExitCode: 0, // TODO: Get actual exit code from runtime
+	})
+}
+
+// resetAuth writes a fresh token into a running agent's container and signals
+// sciontool init (PID 1) to restart its token refresh loop via SIGUSR2.
+func (s *Server) resetAuth(w http.ResponseWriter, r *http.Request, id, projectID string) {
+	ctx := r.Context()
+
+	var req ResetAuthRequest
+	if err := readJSON(r, &req); err != nil {
+		BadRequest(w, "Invalid request body: "+err.Error())
+		return
+	}
+
+	if req.Token == "" {
+		ValidationError(w, "token is required", nil)
+		return
+	}
+
+	rt := s.resolveRuntimeForAgent(ctx, id, projectID)
+	target, err := s.LookupContainerID(ctx, id, projectID)
+	if err != nil || target == "" {
+		NotFound(w, "Agent")
+		return
+	}
+
+	// Write the token to the canonical file atomically via temp+rename.
+	// Write the token to the canonical file atomically via temp+rename.
+	// Pass the token as part of the script using a heredoc pattern to avoid
+	// exposing it in argv (visible in /proc).
+	writeCmd := []string{"sh", "-c",
+		"TOKEN_DIR=\"$(getent passwd scion 2>/dev/null | cut -d: -f6 || echo /home/scion)/.scion\" && " +
+			"mkdir -p \"$TOKEN_DIR\" && " +
+			"cat <<'SCION_TOKEN_EOF' > \"$TOKEN_DIR/scion-token.tmp\"\n" + req.Token + "\nSCION_TOKEN_EOF\n" +
+			"mv \"$TOKEN_DIR/scion-token.tmp\" \"$TOKEN_DIR/scion-token\"",
+	}
+
+	if _, err := rt.Exec(ctx, target, writeCmd); err != nil {
+		s.agentLifecycleLog.Error("reset-auth: failed to write token file", "agent_id", id, "error", err)
+		RuntimeError(w, "Failed to write token file: "+err.Error())
+		return
+	}
+
+	// Signal sciontool init (PID 1) to re-read the token and restart its refresh
+	// loop immediately. The token was already written above, and the agent also
+	// polls the token file as a UID-safe fallback, so it recovers within a few
+	// seconds even if this signal fails. In rootless containers the broker execs
+	// as the scion user and `kill -USR2 1` against the root-owned PID 1 fails
+	// with EPERM — this is expected and not an error since the token is on disk.
+	signalCmd := []string{"kill", "-USR2", "1"}
+	signaled := true
+	if _, err := rt.Exec(ctx, target, signalCmd); err != nil {
+		signaled = false
+		s.agentLifecycleLog.Warn("reset-auth: failed to signal PID 1 (token still written, poller will reload)", "agent_id", id, "error", err)
+	}
+
+	s.agentLifecycleLog.Info("Auth reset completed", "agent_id", id, "signaled", signaled)
+
+	s.forceHeartbeatAll("reset-auth", id)
+
+	msg := "Auth reset: token written and init signaled"
+	if !signaled {
+		msg = "Auth reset: token written; signal failed (poller will reload)"
+	}
+	writeJSON(w, http.StatusOK, ResetAuthResponse{
+		Message: msg,
 	})
 }
 
@@ -2212,6 +2350,7 @@ func (s *Server) finalizeEnv(w http.ResponseWriter, r *http.Request, id string) 
 		CreatorName:     origReq.CreatorName,
 		ResolvedEnv:     pending.MergedEnv,
 		ResolvedSecrets: origReq.ResolvedSecrets,
+		NoAuth:          origReq.NoAuth,
 		Attach:          origReq.Attach,
 		HTTPRequest:     r,
 	})
@@ -2619,4 +2758,28 @@ func isLocalhostEndpoint(endpoint string) bool {
 	}
 	host := u.Hostname()
 	return host == "localhost" || host == "127.0.0.1" || host == "::1"
+}
+
+// ensureNFSMountsReady verifies that all configured NFS shares are mounted
+// before dispatching an agent. This is a pre-flight check (N1-7):
+// the reconciler may have mounted them at startup, but a transient
+// unmount (network blip, manual intervention) should block dispatches.
+// Returns an error if any configured share cannot be mounted — the caller
+// should reject the dispatch to avoid silent fallback to a broken mount.
+func (s *Server) ensureNFSMountsReady() error {
+	if s.nfsMountReconciler == nil {
+		return nil // NFS not configured — local backend, nothing to check.
+	}
+
+	nfsCfg := s.config.NFSConfig
+	if nfsCfg == nil || len(nfsCfg.Shares) == 0 {
+		return nil
+	}
+
+	for _, share := range nfsCfg.Shares {
+		if err := s.nfsMountReconciler.EnsureShareMounted(share.ID); err != nil {
+			return err
+		}
+	}
+	return nil
 }

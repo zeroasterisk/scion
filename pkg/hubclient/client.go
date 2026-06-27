@@ -42,6 +42,12 @@ type Client interface {
 	// RuntimeBrokers returns the runtime broker operations interface.
 	RuntimeBrokers() RuntimeBrokerService
 
+	// Skills returns the skill operations interface.
+	Skills() SkillService
+
+	// SkillRegistries returns the skill registry operations interface.
+	SkillRegistries() SkillRegistryService
+
 	// Templates returns the template operations interface.
 	Templates() TemplateService
 
@@ -104,6 +110,8 @@ type client struct {
 	agents                *agentService
 	projects              *projectService
 	runtimeBrokers        *runtimeBrokerService
+	skills                *skillService
+	skillRegistries       *skillRegistryService
 	templates             *templateService
 	harnessConfigs        *harnessConfigService
 	workspace             *workspaceService
@@ -134,6 +142,8 @@ func New(baseURL string, opts ...Option) (Client, error) {
 	c.agents = &agentService{c: c}
 	c.projects = &projectService{c: c}
 	c.runtimeBrokers = &runtimeBrokerService{c: c}
+	c.skills = &skillService{c: c}
+	c.skillRegistries = &skillRegistryService{c: c}
 	c.templates = &templateService{c: c}
 	c.harnessConfigs = &harnessConfigService{c: c}
 	c.workspace = &workspaceService{c: c}
@@ -170,6 +180,16 @@ func (c *client) Projects() ProjectService {
 // RuntimeBrokers returns the runtime broker operations interface.
 func (c *client) RuntimeBrokers() RuntimeBrokerService {
 	return c.runtimeBrokers
+}
+
+// Skills returns the skill operations interface.
+func (c *client) Skills() SkillService {
+	return c.skills
+}
+
+// SkillRegistries returns the skill registry operations interface.
+func (c *client) SkillRegistries() SkillRegistryService {
+	return c.skillRegistries
 }
 
 // Templates returns the template operations interface.
@@ -343,6 +363,13 @@ func (c *client) Health(ctx context.Context) (*HealthResponse, error) {
 	resp, err := c.get(ctx, "/healthz", nil)
 	if err != nil {
 		return nil, err
+	}
+	if resp.StatusCode == 404 {
+		resp.Body.Close()
+		resp, err = c.get(ctx, "/health", nil)
+		if err != nil {
+			return nil, err
+		}
 	}
 	return apiclient.DecodeResponse[HealthResponse](resp)
 }

@@ -61,6 +61,12 @@ const (
 	ErrCodeCloneFailed    = "clone_failed"
 	ErrCodePullFailed     = "pull_failed"
 
+	// Delivery error codes
+	ErrCodeAgentNotFound   = "agent_not_found"
+	ErrCodeDeliveryFailed  = "delivery_failed"
+	ErrCodeAgentNotRunning = "agent_not_running"
+	ErrCodeBrokerTimeout   = "broker_timeout"
+
 	// Broker authentication error codes
 	ErrCodeInvalidJoinToken = "invalid_join_token"
 	ErrCodeExpiredJoinToken = "expired_join_token"
@@ -91,7 +97,7 @@ func writeError(w http.ResponseWriter, statusCode int, code, message string, det
 		},
 	}
 
-	json.NewEncoder(w).Encode(resp)
+	_ = json.NewEncoder(w).Encode(resp)
 }
 
 // writeErrorFromErr writes an error response based on a Go error.
@@ -155,7 +161,7 @@ func writeErrorFromErr(w http.ResponseWriter, err error, requestID string) {
 		},
 	}
 
-	json.NewEncoder(w).Encode(resp)
+	_ = json.NewEncoder(w).Encode(resp)
 }
 
 // NotFound writes a 404 Not Found response.
@@ -210,7 +216,7 @@ func RuntimeError(w http.ResponseWriter, message string) {
 
 // GatewayTimeout writes a 504 Gateway Timeout response for runtime broker timeouts.
 func GatewayTimeout(w http.ResponseWriter, message string) {
-	writeError(w, http.StatusGatewayTimeout, ErrCodeUnavailable, message, nil)
+	writeError(w, http.StatusGatewayTimeout, ErrCodeBrokerTimeout, message, nil)
 }
 
 // NoRuntimeBroker writes a 422 Unprocessable Entity response when no runtime broker

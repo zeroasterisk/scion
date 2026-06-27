@@ -16,6 +16,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -349,6 +350,10 @@ func runInit(args []string) int {
 		}
 	}
 
+	// Initialize hubClient early so the metadata server's fetch callbacks
+	// can use it without data races or startup race conditions.
+	hubClient := hub.NewClient()
+
 	// Start GCP metadata server if configured
 	var metadataServer *metadata.Server
 	if metaCfg := metadata.ConfigFromEnv(); metaCfg != nil {
@@ -363,6 +368,34 @@ func runInit(args []string) int {
 		// uses the latest agent token after refresh, not the startup value.
 		metaCfg.TokenFunc = func() string {
 			return hub.ReadTokenFile()
+		}
+		// Delegate GCP token fetching to the hub client so the metadata
+		// server uses the correct auth headers (X-Scion-Agent-Token) and
+		// OIDC transport layer. The hub client is created after the metadata
+		// server starts, so the closures capture the hubClient variable
+		// which is set later. Token requests only arrive after the child
+		// process has started, so the hub client is always available by then.
+		metaCfg.FetchGCPToken = func(ctx context.Context, scopes []string) (*metadata.GCPAccessTokenResponse, error) {
+			hc := hubClient
+			if hc == nil || !hc.IsConfigured() {
+				return nil, fmt.Errorf("hub client not initialized")
+			}
+			hubResp, err := hc.FetchGCPToken(ctx, scopes)
+			if err != nil {
+				return nil, err
+			}
+			return &metadata.GCPAccessTokenResponse{
+				AccessToken: hubResp.AccessToken,
+				ExpiresIn:   hubResp.ExpiresIn,
+				TokenType:   hubResp.TokenType,
+			}, nil
+		}
+		metaCfg.FetchGCPIdentityToken = func(ctx context.Context, audience string) (string, error) {
+			hc := hubClient
+			if hc == nil || !hc.IsConfigured() {
+				return "", fmt.Errorf("hub client not initialized")
+			}
+			return hc.FetchGCPIdentityToken(ctx, audience)
 		}
 		metadataServer = metadata.New(*metaCfg)
 		metaCtx := context.Background()
@@ -405,9 +438,13 @@ func runInit(args []string) int {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	// Set up signal handling with pre-stop hook for graceful shutdown
+	// Set up signal handling with pre-stop hook for graceful shutdown.
+	// requestedShutdown tracks whether the process received an intentional
+	// SIGTERM/SIGINT so classifyExit can distinguish a clean stop from a crash.
+	var requestedShutdown atomic.Bool
 	sigHandler := supervisor.NewSignalHandler(sup, cancel).
 		WithPreStopHook(func() error {
+			requestedShutdown.Store(true)
 			log.Info("Running pre-stop hooks...")
 			return lifecycleManager.RunPreStop()
 		})
@@ -429,7 +466,7 @@ func runInit(args []string) int {
 		}{code, err}
 	}()
 
-	// Heartbeat and token refresh control variables - declared here so they're accessible during shutdown
+	// Heartbeat and token refresh control variables - declared here so they're accessible during shutdown and auth reset
 	var heartbeatCancel context.CancelFunc
 	var heartbeatDone <-chan struct{}
 	var tokenRefreshCancel context.CancelFunc
@@ -458,7 +495,6 @@ func runInit(args []string) int {
 		}
 
 		// Report running status to Hub if in hosted mode
-		hubClient := hub.NewClient()
 		log.Debug("Hub client check: client=%v, configured=%v", hubClient != nil, hubClient != nil && hubClient.IsConfigured())
 		log.Debug("Hub env: SCION_HUB_ENDPOINT=%q, SCION_HUB_URL=%q, token_file=%v, SCION_AGENT_ID=%q",
 			os.Getenv("SCION_HUB_ENDPOINT"), os.Getenv("SCION_HUB_URL"), hub.ReadTokenFile() != "", os.Getenv("SCION_AGENT_ID"))
@@ -514,41 +550,40 @@ func runInit(args []string) int {
 				// Schedule refresh 2 hours before expiry
 				refreshAt := tokenExpiry.Add(-2 * time.Hour)
 				if refreshAt.Before(time.Now()) {
-					// Token is already within the refresh window or expired
+					// Token is already within the refresh window or expired —
+					// refresh immediately in both cases. On resume the persisted
+					// token may have expired while the agent was stopped; always
+					// starting the refresh loop lets StartTokenRefresh retry with
+					// backoff and fire OnAuthLost if recovery fails, instead of
+					// silently giving up.
+					refreshAt = time.Now()
 					if time.Now().Before(tokenExpiry) {
-						// Still valid, refresh immediately
-						refreshAt = time.Now()
 						log.Info("Token within refresh window, refreshing immediately (expires: %s)", tokenExpiry.Format(time.RFC3339))
 					} else {
-						// Token has already expired
-						log.Error("AUTH_EXPIRED: Agent token has expired at %s - hub communication will fail", tokenExpiry.Format(time.RFC3339))
-						log.Error("AUTH_EXPIRED: Agent limits (max-duration, max-turns, max-model-calls) are enforced locally and remain active")
-						refreshAt = time.Time{} // signal not to start refresh
+						log.Error("AUTH_EXPIRED: Agent token has expired at %s - attempting refresh", tokenExpiry.Format(time.RFC3339))
 					}
 				} else {
 					log.Info("Token refresh scheduled at %s (token expires: %s)",
 						refreshAt.Format(time.RFC3339), tokenExpiry.Format(time.RFC3339))
 				}
 
-				if !refreshAt.IsZero() {
-					var tokenRefreshCtx context.Context
-					tokenRefreshCtx, tokenRefreshCancel = context.WithCancel(context.Background())
-					tokenRefreshDone = hubClient.StartTokenRefresh(tokenRefreshCtx, &hub.TokenRefreshConfig{
-						RefreshAt: refreshAt,
-						ChownUID:  targetUID,
-						ChownGID:  targetGID,
-						OnRefreshed: func(newExpiry time.Time) {
-							log.Info("Token refreshed successfully, new expiry: %s", newExpiry.Format(time.RFC3339))
-						},
-						OnError: func(err error) {
-							log.Error("Token refresh failed: %v", err)
-						},
-						OnAuthLost: func() {
-							log.Error("AUTH_LOST: Agent token has expired and could not be refreshed - hub communication is no longer possible")
-							log.Error("AUTH_LOST: Agent limits (max-duration, max-turns, max-model-calls) are enforced locally and remain active")
-						},
-					})
-				}
+				var tokenRefreshCtx context.Context
+				tokenRefreshCtx, tokenRefreshCancel = context.WithCancel(context.Background())
+				tokenRefreshDone = hubClient.StartTokenRefresh(tokenRefreshCtx, &hub.TokenRefreshConfig{
+					RefreshAt: refreshAt,
+					ChownUID:  targetUID,
+					ChownGID:  targetGID,
+					OnRefreshed: func(newExpiry time.Time) {
+						log.Info("Token refreshed successfully, new expiry: %s", newExpiry.Format(time.RFC3339))
+					},
+					OnError: func(err error) {
+						log.Error("Token refresh failed: %v", err)
+					},
+					OnAuthLost: func() {
+						log.Error("AUTH_LOST: Agent token has expired and could not be refreshed - hub communication is no longer possible")
+						log.Error("AUTH_LOST: Agent limits (max-duration, max-turns, max-model-calls) are enforced locally and remain active")
+					},
+				})
 			}
 		} else {
 			log.Debug("Hub client not configured - skipping status report")
@@ -626,6 +661,7 @@ func runInit(args []string) int {
 							ChownGID:  targetGID,
 							OnRefreshed: func(newToken string, newExpiry time.Time) {
 								log.Info("GitHub token refreshed, new expiry: %s", newExpiry.Format(time.RFC3339))
+								writeEnvFile(agentHome, targetUID, targetGID)
 							},
 							OnError: func(err error) {
 								log.Error("GitHub token refresh failed: %v", err)
@@ -644,6 +680,13 @@ func runInit(args []string) int {
 	usr1Chan := make(chan os.Signal, 1)
 	signal.Notify(usr1Chan, syscall.SIGUSR1)
 	defer signal.Stop(usr1Chan)
+
+	// Set up SIGUSR2 handler for auth reset. When the broker writes a fresh
+	// token to ~/.scion/scion-token and sends SIGUSR2, init re-reads the
+	// token, updates the hub client, and restarts the token refresh loop.
+	usr2Chan := make(chan os.Signal, 1)
+	signal.Notify(usr2Chan, syscall.SIGUSR2)
+	defer signal.Stop(usr2Chan)
 
 	// Set up duration timer if max_duration is configured
 	var durationTimer <-chan time.Time
@@ -688,37 +731,48 @@ func runInit(args []string) int {
 		go watchLimitsTriggerFile(triggerCtx, triggerChan)
 	}
 
-	// Wait for child to exit, duration limit, SIGUSR1, or trigger file
+	// Wait for child to exit, duration limit, SIGUSR1, SIGUSR2, or trigger file.
+	// The loop allows SIGUSR2 (auth reset) to be handled without terminating.
 	var result struct {
 		code int
 		err  error
 	}
 	limitsExceeded := false
 
-	select {
-	case r := <-exitChan:
-		result = r
-	case <-durationTimer:
-		limitsExceeded = true
-		handleLimitsExceeded(sup, "duration", fmt.Sprintf("max_duration of %s exceeded", maxDurStr))
-		result = <-exitChan
-	case <-usr1Chan:
-		// SIGUSR1 received from hook handler - limits already set in agent-info.json
-		limitsExceeded = true
-		log.TaggedInfo("LIMITS_EXCEEDED", "Received SIGUSR1: limit exceeded, initiating shutdown")
-		// Initiate graceful shutdown of the child process
-		if err := sup.Signal(syscall.SIGTERM); err != nil {
-			log.Error("Failed to send SIGTERM to child: %v", err)
+waitLoop:
+	for {
+		select {
+		case r := <-exitChan:
+			result = r
+			break waitLoop
+		case <-durationTimer:
+			limitsExceeded = true
+			handleLimitsExceeded(sup, "duration", fmt.Sprintf("max_duration of %s exceeded", maxDurStr))
+			result = <-exitChan
+			break waitLoop
+		case <-usr1Chan:
+			// SIGUSR1 received from hook handler - limits already set in agent-info.json
+			limitsExceeded = true
+			log.TaggedInfo("LIMITS_EXCEEDED", "Received SIGUSR1: limit exceeded, initiating shutdown")
+			if err := sup.Signal(syscall.SIGTERM); err != nil {
+				log.Error("Failed to send SIGTERM to child: %v", err)
+			}
+			result = <-exitChan
+			break waitLoop
+		case <-usr2Chan:
+			// SIGUSR2: auth reset — re-read token file and restart refresh loop.
+			handleAuthReset(hubClient, &tokenRefreshCancel, &tokenRefreshDone, statusHandler, targetUID, targetGID)
+			// Continue waiting — this is non-terminal.
+		case <-triggerChan:
+			// Trigger file detected from hook handler - limits already set in agent-info.json
+			limitsExceeded = true
+			log.TaggedInfo("LIMITS_EXCEEDED", "Trigger file detected: limit exceeded, initiating shutdown")
+			if err := sup.Signal(syscall.SIGTERM); err != nil {
+				log.Error("Failed to send SIGTERM to child: %v", err)
+			}
+			result = <-exitChan
+			break waitLoop
 		}
-		result = <-exitChan
-	case <-triggerChan:
-		// Trigger file detected from hook handler - limits already set in agent-info.json
-		limitsExceeded = true
-		log.TaggedInfo("LIMITS_EXCEEDED", "Trigger file detected: limit exceeded, initiating shutdown")
-		if err := sup.Signal(syscall.SIGTERM); err != nil {
-			log.Error("Failed to send SIGTERM to child: %v", err)
-		}
-		result = <-exitChan
 	}
 
 	// Stop token refresh loops and heartbeat before reporting shutdown status to prevent races
@@ -785,31 +839,30 @@ func runInit(args []string) int {
 	if !limitsExceeded && result.code == handlers.ExitCodeLimitsExceeded {
 		limitsExceeded = true
 	}
-	finalCode := result.code
-	if limitsExceeded {
-		finalCode = handlers.ExitCodeLimitsExceeded
-	} else if result.err != nil && result.code == 0 {
-		finalCode = 1
-	}
-	isCrash := !limitsExceeded && finalCode != 0
 
-	// Build crash message: distinguish real child exit codes from
-	// synthetic ones produced by supervisor errors.
-	var crashMsg string
-	if isCrash {
-		if result.err != nil && result.code == 0 {
-			crashMsg = fmt.Sprintf("Agent crashed (supervisor error: %v)", result.err)
-		} else {
-			crashMsg = fmt.Sprintf("Agent crashed with exit code %d", finalCode)
-		}
+	// The harness runs as a tmux grandchild, so the supervised child's exit
+	// code (result.code) reflects sh/tmux, not the harness itself. The tmux
+	// agent-window wrapper records the harness's real exit code to a fixed
+	// file; prefer it when present. If absent (e.g. the container was SIGKILLed
+	// or OOM-killed before the harness could write), fall back to result.code.
+	harnessCode := readHarnessExitCode()
+	if harnessCode != nil {
+		log.Info("Recovered harness exit code %d from %s", *harnessCode, state.HarnessExitCodeFile)
 	}
+
+	outcome := classifyExit(result.code, result.err, harnessCode, limitsExceeded, requestedShutdown.Load())
+	finalCode := outcome.exitCode
+	limitsExceeded = outcome.limitsExceeded
 
 	// Update local agent-info.json BEFORE the Hub report so the broker
 	// heartbeat can relay crash/limits state even if the Hub call is slow
 	// or fails entirely.
-	if isCrash {
-		statusHandler.UpdatePhase(state.PhaseStopped, state.ActivityCrashed, "")
-		statusHandler.SetMessage(crashMsg)
+	if outcome.isCrash {
+		// HYBRID mapping: an unexpected non-zero exit becomes PhaseError with
+		// the activity cleared (crash detail lives in the message + exitCode).
+		// `crashed` activity is only valid on PhaseStopped per state validation.
+		statusHandler.UpdatePhase(state.PhaseError, "", "")
+		statusHandler.SetMessage(outcome.message)
 	} else if limitsExceeded {
 		statusHandler.UpdatePhase(state.PhaseStopped, state.ActivityLimitsExceeded, "")
 		statusHandler.SetMessage("limits exceeded")
@@ -819,13 +872,13 @@ func runInit(args []string) int {
 	if hubClient := hub.NewClient(); hubClient != nil && hubClient.IsConfigured() {
 		hubCtx, hubCancel := context.WithTimeout(context.Background(), 5*time.Second)
 		var hubErr error
-		if isCrash {
-			s := state.AgentState{Phase: state.PhaseStopped, Activity: state.ActivityCrashed}
+		if outcome.isCrash {
+			s := state.AgentState{Phase: state.PhaseError}
 			hubErr = hubClient.UpdateStatus(hubCtx, hub.StatusUpdate{
-				Phase:    state.PhaseStopped,
-				Activity: state.ActivityCrashed,
+				Phase:    state.PhaseError,
+				Activity: "",
 				Status:   s.DisplayStatus(),
-				Message:  crashMsg,
+				Message:  outcome.message,
 				ExitCode: &finalCode,
 			})
 		} else if limitsExceeded {
@@ -843,7 +896,7 @@ func runInit(args []string) int {
 		if hubErr != nil {
 			log.Error("Failed to report final status to Hub: %v", hubErr)
 		} else {
-			log.Info("Reported final status to Hub (exitCode=%d, crash=%v)", finalCode, isCrash)
+			log.Info("Reported final status to Hub (exitCode=%d, crash=%v)", finalCode, outcome.isCrash)
 		}
 		hubCancel()
 	}
@@ -853,6 +906,14 @@ func runInit(args []string) int {
 		return handlers.ExitCodeLimitsExceeded
 	}
 
+	if outcome.isCrash {
+		// Propagate the authoritative crash code (which may have come from the
+		// harness exit-code file rather than the supervised child) so the
+		// container's exit status reflects the real failure.
+		log.Error("Agent crashed with exit code %d", finalCode)
+		return finalCode
+	}
+
 	if result.err != nil {
 		log.Error("Supervisor error: %v", result.err)
 		return 1
@@ -860,6 +921,85 @@ func runInit(args []string) int {
 
 	log.Info("Child exited with code %d", result.code)
 	return result.code
+}
+
+// readHarnessExitCode reads and parses the harness exit-code file written by the
+// tmux agent-window wrapper. Returns nil if the file is missing or unparseable
+// (e.g. the container was SIGKILLed/OOM-killed before the harness could write).
+func readHarnessExitCode() *int {
+	data, err := os.ReadFile(state.HarnessExitCodeFile)
+	if err != nil {
+		return nil
+	}
+	code, err := strconv.Atoi(strings.TrimSpace(string(data)))
+	if err != nil {
+		return nil
+	}
+	return &code
+}
+
+// exitOutcome captures the classified result of a supervised agent exit.
+type exitOutcome struct {
+	exitCode       int
+	limitsExceeded bool
+	isCrash        bool
+	message        string
+}
+
+// classifyExit applies the HYBRID exit mapping. It is a pure function so it can
+// be unit-tested independently of the supervisor/hub machinery.
+//
+//   - limitsExceeded                  → stopped + limits_exceeded (handled by caller)
+//   - clean exit (code 0, no error)   → stopped
+//   - requestedShutdown + code -1     → stopped (signal-killed by intentional SIGTERM)
+//   - unexpected non-zero exit/error  → error (crash), restartable
+//
+// harnessCode, when non-nil, is the authoritative harness exit code recovered
+// from the exit-code file and overrides the supervised child's code for the
+// crash decision. supervisorErr is the supervisor's own error (a synthetic
+// failure not reflected in supervisedCode). requestedShutdown is true when
+// init received SIGTERM/SIGINT, indicating the container was intentionally
+// stopped — a signal-killed child (exit code -1) is expected, not a crash.
+func classifyExit(supervisedCode int, supervisorErr error, harnessCode *int, limitsExceeded bool, requestedShutdown bool) exitOutcome {
+	if !limitsExceeded && supervisedCode == handlers.ExitCodeLimitsExceeded {
+		limitsExceeded = true
+	}
+
+	// Choose the authoritative exit code: prefer the harness file, then the
+	// supervised child code.
+	finalCode := supervisedCode
+	if harnessCode != nil {
+		finalCode = *harnessCode
+	}
+
+	if limitsExceeded {
+		return exitOutcome{exitCode: handlers.ExitCodeLimitsExceeded, limitsExceeded: true}
+	}
+
+	// When init was told to shut down (SIGTERM/SIGINT), the child is killed by
+	// signal and Go reports exit code -1. This is expected, not a crash.
+	if requestedShutdown && finalCode == -1 {
+		return exitOutcome{exitCode: 0}
+	}
+
+	// A supervisor error with a zero exit code is itself a failure.
+	supervisorFailed := supervisorErr != nil && finalCode == 0
+	if supervisorFailed {
+		finalCode = 1
+	}
+
+	isCrash := finalCode != 0
+	if !isCrash {
+		return exitOutcome{exitCode: 0}
+	}
+
+	var msg string
+	if supervisorFailed {
+		msg = fmt.Sprintf("Agent crashed (supervisor error: %v)", supervisorErr)
+	} else {
+		msg = fmt.Sprintf("Agent crashed with exit code %d", finalCode)
+	}
+	return exitOutcome{exitCode: finalCode, isCrash: true, message: msg}
 }
 
 // handleLimitsExceeded is called when a limit is exceeded (duration timer or SIGUSR1).
@@ -886,6 +1026,93 @@ func handleLimitsExceeded(sup *supervisor.Supervisor, limitType, message string)
 	// 4. Send SIGTERM to child process
 	if err := sup.Signal(syscall.SIGTERM); err != nil {
 		log.Error("Failed to send SIGTERM to child: %v", err)
+	}
+}
+
+// handleAuthReset re-reads the token file, updates the hub client, and
+// restarts the token refresh loop. Called when SIGUSR2 is received from the
+// broker's reset-auth handler.
+func handleAuthReset(hubClient *hub.Client, tokenRefreshCancel *context.CancelFunc, tokenRefreshDone *<-chan struct{}, statusHandler *handlers.StatusHandler, targetUID, targetGID int) {
+	log.TaggedInfo("AUTH_RESET", "Received SIGUSR2: auth reset requested")
+
+	if hubClient == nil {
+		log.Error("AUTH_RESET: Hub client is not configured, cannot reset auth")
+		return
+	}
+
+	newToken := hub.ReadTokenFile()
+	if newToken == "" {
+		log.Error("AUTH_RESET: Token file is empty after SIGUSR2, cannot reset auth")
+		return
+	}
+
+	tokenExpiry, err := hub.ParseTokenExpiry(newToken)
+	if err != nil {
+		log.Error("AUTH_RESET: Cannot parse new token expiry: %v", err)
+		return
+	}
+
+	// Cancel the existing token refresh loop if running.
+	if *tokenRefreshCancel != nil {
+		(*tokenRefreshCancel)()
+		if *tokenRefreshDone != nil {
+			<-*tokenRefreshDone
+		}
+	}
+
+	// Update the hub client's in-memory token.
+	if hubClient != nil {
+		hubClient.SetToken(newToken)
+	}
+
+	// Clear any AUTH_LOST message from agent-info.json.
+	statusHandler.SetMessage("")
+
+	// Schedule refresh 2 hours before the new token's expiry.
+	refreshAt := tokenExpiry.Add(-2 * time.Hour)
+	if refreshAt.Before(time.Now()) {
+		if time.Now().Before(tokenExpiry) {
+			refreshAt = time.Now().Add(1 * time.Minute)
+		} else {
+			log.Error("AUTH_RESET: New token is already expired at %s", tokenExpiry.Format(time.RFC3339))
+			return
+		}
+	}
+
+	// Start a new token refresh loop.
+	var tokenRefreshCtx context.Context
+	var cancel context.CancelFunc
+	tokenRefreshCtx, cancel = context.WithCancel(context.Background())
+	*tokenRefreshCancel = cancel
+	*tokenRefreshDone = hubClient.StartTokenRefresh(tokenRefreshCtx, &hub.TokenRefreshConfig{
+		RefreshAt: refreshAt,
+		ChownUID:  targetUID,
+		ChownGID:  targetGID,
+		OnRefreshed: func(newExpiry time.Time) {
+			log.Info("Token refreshed successfully, new expiry: %s", newExpiry.Format(time.RFC3339))
+		},
+		OnError: func(err error) {
+			log.Error("Token refresh failed: %v", err)
+		},
+		OnAuthLost: func() {
+			log.Error("AUTH_LOST: Agent token has expired and could not be refreshed - hub communication is no longer possible")
+			log.Error("AUTH_LOST: Agent limits (max-duration, max-turns, max-model-calls) are enforced locally and remain active")
+			statusHandler.SetMessage("AUTH_LOST: Hub token expired and could not be refreshed")
+		},
+	})
+
+	log.TaggedInfo("AUTH_RESET", "Auth reset complete — new token expires %s, refresh at %s",
+		tokenExpiry.Format(time.RFC3339), refreshAt.Format(time.RFC3339))
+
+	// Send an immediate heartbeat with the new token.
+	if hubClient != nil && hubClient.IsConfigured() {
+		hubCtx, hubCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		if err := hubClient.Heartbeat(hubCtx); err != nil {
+			log.Error("AUTH_RESET: Post-reset heartbeat failed: %v", err)
+		} else {
+			log.Info("AUTH_RESET: Post-reset heartbeat sent successfully")
+		}
+		hubCancel()
 	}
 }
 
@@ -1624,8 +1851,14 @@ func writeEnvFile(agentHome string, uid, gid int) {
 	}
 
 	envPath := filepath.Join(scionDir, "scion-env")
-	if err := os.WriteFile(envPath, []byte(strings.Join(lines, "\n")+"\n"), 0644); err != nil {
-		log.Error("Failed to write scion-env file: %v", err)
+	tmpPath := envPath + ".tmp"
+	if err := os.WriteFile(tmpPath, []byte(strings.Join(lines, "\n")+"\n"), 0644); err != nil {
+		log.Error("Failed to write temporary scion-env file: %v", err)
+		return
+	}
+	if err := os.Rename(tmpPath, envPath); err != nil {
+		log.Error("Failed to atomically rename scion-env file: %v", err)
+		os.Remove(tmpPath)
 		return
 	}
 

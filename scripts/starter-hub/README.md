@@ -17,6 +17,9 @@ file paths from two primary variables:
 | `HUB_NAME` | `demo` | Deployment name — drives GCE instance, SA, firewall rule, cluster, and DNS names |
 | `BASE_DOMAIN` | `scion-ai.dev` | Root domain — combined with `HUB_NAME` to form `hub.<name>.<base>` |
 | `ENABLE_GKE` | `false` | Set to `true` to provision a GKE cluster, grant `container.admin`, configure credentials, and use Kubernetes as the default runtime. |
+| `REGION` | `us-central1` | GCP region for GKE and resource locations |
+| `ZONE` | `us-central1-a` | GCP zone for the GCE VM instance |
+| `MACHINE_TYPE` | *(derived)* | Compute machine type to use (overrides `SIZE_CHOICE`) |
 
 To stand up a second hub (e.g., "staging"):
 

@@ -22,6 +22,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 
 	"github.com/GoogleCloudPlatform/scion/pkg/api"
@@ -288,6 +289,7 @@ type ProvisionInputs struct {
 	Telemetry      string `json:"telemetry,omitempty"`
 	AuthCandidates string `json:"auth_candidates,omitempty"`
 	MCPServers     string `json:"mcp_servers,omitempty"`
+	ResolvedSkills string `json:"resolved_skills,omitempty"`
 }
 
 type ProvisionOutputs struct {
@@ -338,6 +340,11 @@ func (c *ContainerScriptHarness) Provision(ctx context.Context, agentName, agent
 		}
 	}
 
+	// Stage capture_auth.py and capture-auth-config.json into the bundle.
+	if err := c.stageCaptureAuthConfig(agentHome); err != nil {
+		return fmt.Errorf("stage capture-auth assets: %w", err)
+	}
+
 	// Copy dialect.yaml if present.
 	dialectSrc := filepath.Join(c.configDirPath, "dialect.yaml")
 	if fileExistsHelper(dialectSrc) {
@@ -386,6 +393,9 @@ func (c *ContainerScriptHarness) Provision(ctx context.Context, agentName, agent
 	if fileExistsHelper(filepath.Join(bundleHostPath, "inputs", "mcp-servers.json")) {
 		manifest.Inputs.MCPServers = filepath.Join(bundleContainerPath, "inputs", "mcp-servers.json")
 	}
+	if fileExistsHelper(filepath.Join(bundleHostPath, "inputs", "resolved-skills.json")) {
+		manifest.Inputs.ResolvedSkills = filepath.Join(bundleContainerPath, "inputs", "resolved-skills.json")
+	}
 
 	manifestPath := filepath.Join(bundleHostPath, "manifest.json")
 	manifestData, err := json.MarshalIndent(manifest, "", "  ")
@@ -412,6 +422,13 @@ func (c *ContainerScriptHarness) Provision(ctx context.Context, agentName, agent
 // value (e.g. Codex writes its API key into .codex/auth.json) read the file
 // because sciontool harness provision strips secret env vars from the script's
 // process environment for containment.
+//
+// For file-based credentials declared in required_files (e.g. auth-file mode),
+// the file content is read from the host SourcePath and staged as a secret file
+// under agent_home/.scion/harness/secrets/<NAME> (mode 0600). The path is
+// recorded in file_secret_files in auth-candidates.json so the container-side
+// script can write a fresh writable copy. The FileMapping is removed from
+// resolved.Files so the runtime does not bind-mount the file read-only.
 func (c *ContainerScriptHarness) ApplyAuthSettings(agentHome string, resolved *api.ResolvedAuth) error {
 	if resolved == nil {
 		return nil
@@ -422,19 +439,135 @@ func (c *ContainerScriptHarness) ApplyAuthSettings(agentHome string, resolved *a
 		return err
 	}
 
+	fileSecretFiles, remainingFiles, err := c.stageFileSecretFiles(agentHome, resolved.Files)
+	if err != nil {
+		return err
+	}
+	// Remove staged-as-secret FileMappings from resolved so the runtime does
+	// not also bind-mount them (which would create a read-only overlay that
+	// prevents the container-side script from writing the file).
+	resolved.Files = remainingFiles
+
 	payload := map[string]interface{}{
-		"schema_version":   1,
-		"explicit_type":    c.entry.AuthSelectedType,
-		"resolved_method":  resolved.Method,
-		"env_vars":         sortedKeys(resolved.EnvVars),
-		"env_secret_files": envSecretFiles,
-		"files":            fileMappingsToJSON(resolved.Files),
+		"schema_version":    1,
+		"explicit_type":     c.entry.AuthSelectedType,
+		"resolved_method":   resolved.Method,
+		"env_vars":          sortedKeys(resolved.EnvVars),
+		"env_secret_files":  envSecretFiles,
+		"file_secret_files": fileSecretFiles,
+		"files":             fileMappingsToJSON(resolved.Files),
 	}
 	data, err := json.MarshalIndent(payload, "", "  ")
 	if err != nil {
 		return fmt.Errorf("marshal auth candidates: %w", err)
 	}
 	return c.stageInputFile(agentHome, "auth-candidates.json", data)
+}
+
+// stageFileSecretFiles reads the content of each FileMapping whose ContainerPath
+// matches a required_files declaration in the harness config, writes it to
+// agent_home/.scion/harness/secrets/<NAME> (mode 0600), and returns:
+//   - fileSecretFiles: map of name -> "$HOME/.scion/harness/secrets/<NAME>" for
+//     the staged secrets (to be written into file_secret_files in auth-candidates.json)
+//   - remainingFiles: the FileMappings that were NOT staged as secrets and should
+//     still be passed to the runtime for bind-mounting
+//
+// This prevents read-only bind-mounts for credential files that the container-side
+// provisioner script needs to write (e.g. Codex auth.json).
+func (c *ContainerScriptHarness) stageFileSecretFiles(agentHome string, files []api.FileMapping) (map[string]string, []api.FileMapping, error) {
+	fileSecretFiles := map[string]string{}
+	if len(files) == 0 || c.entry.Auth == nil {
+		return fileSecretFiles, files, nil
+	}
+
+	// Build a lookup from container path suffix → credential name using the
+	// harness config's required_files declarations.
+	type fileReq struct {
+		name         string
+		targetSuffix string
+	}
+	var reqs []fileReq
+	for _, authType := range c.entry.Auth.Types {
+		for _, rf := range authType.RequiredFiles {
+			if rf.Name == "" || rf.TargetSuffix == "" {
+				continue
+			}
+			reqs = append(reqs, fileReq{name: rf.Name, targetSuffix: rf.TargetSuffix})
+		}
+	}
+	if len(reqs) == 0 {
+		return fileSecretFiles, files, nil
+	}
+
+	// Normalize a container path by expanding ~ to $HOME and stripping trailing
+	// slashes so comparison is consistent. Absolute paths (e.g.
+	// /home/scion/.codex/auth.json) are returned unchanged; tilde paths are
+	// expanded to $HOME/... form.
+	normalize := func(p string) string {
+		p = strings.TrimRight(p, "/")
+		if strings.HasPrefix(p, "~/") {
+			p = "$HOME/" + p[2:]
+		}
+		return p
+	}
+
+	dir := filepath.Join(agentHome, ".scion", "harness", "secrets")
+	dirCreated := false
+
+	var remaining []api.FileMapping
+	for _, f := range files {
+		normCP := normalize(f.ContainerPath)
+
+		// Find a matching required_file entry by container path suffix.
+		// Use HasSuffix so that both tilde paths (~/.codex/auth.json →
+		// $HOME/.codex/auth.json) and absolute paths
+		// (/home/scion/.codex/auth.json) match the same suffix declaration.
+		var matchedName string
+		for _, req := range reqs {
+			suffix := strings.TrimRight(req.targetSuffix, "/")
+			if !strings.HasPrefix(suffix, "/") {
+				suffix = "/" + suffix
+			}
+			if strings.HasSuffix(normCP, suffix) {
+				matchedName = req.name
+				break
+			}
+		}
+
+		if matchedName == "" || !isSafeEnvName(matchedName) {
+			// Not a declared file credential or unsafe name — keep as bind-mount.
+			remaining = append(remaining, f)
+			continue
+		}
+
+		if f.SourcePath == "" {
+			// No host path to read; keep as bind-mount fallback.
+			remaining = append(remaining, f)
+			continue
+		}
+
+		content, err := os.ReadFile(f.SourcePath)
+		if err != nil {
+			return nil, nil, fmt.Errorf("read credential file %s (%s): %w", matchedName, f.SourcePath, err)
+		}
+
+		if !dirCreated {
+			if err := os.MkdirAll(dir, 0700); err != nil {
+				return nil, nil, fmt.Errorf("create secrets dir: %w", err)
+			}
+			dirCreated = true
+		}
+
+		target := filepath.Join(dir, matchedName)
+		if err := os.WriteFile(target, content, 0600); err != nil {
+			return nil, nil, fmt.Errorf("write file secret %s: %w", matchedName, err)
+		}
+		fileSecretFiles[matchedName] = "$HOME/.scion/harness/secrets/" + matchedName
+		// Do NOT add to remaining — this file is now staged as a secret and
+		// must not be bind-mounted.
+	}
+
+	return fileSecretFiles, remaining, nil
 }
 
 // stageEnvSecretFiles writes each non-empty env value to
@@ -522,6 +655,13 @@ func (c *ContainerScriptHarness) ApplyTelemetrySettings(agentHome string, teleme
 		return fmt.Errorf("marshal telemetry input: %w", err)
 	}
 	return c.stageInputFile(agentHome, "telemetry.json", data)
+}
+
+// stageCaptureAuthConfig delegates to the shared StageCaptureAuthAssets
+// helper to generate inputs/capture-auth-config.json from the harness
+// config's auth.types.*.required_files declarations.
+func (c *ContainerScriptHarness) stageCaptureAuthConfig(agentHome string) error {
+	return StageCaptureAuthAssets(agentHome, c.configDirPath, c.entry.Auth)
 }
 
 // stageInputFile writes content under agent_home/.scion/harness/inputs/<name>.
@@ -624,4 +764,88 @@ func expandEnvTemplate(value, agentName, agentHome, unixUsername string) string 
 		out = strings.ReplaceAll(out, placeholder, replacement)
 	}
 	return out
+}
+
+// StageCaptureAuthAssets stages capture_auth.py and its config file into the
+// harness bundle directory at agentHome/.scion/harness/. This is a shared
+// helper called by both container-script and builtin harness Provision methods
+// so the capture script is available at a known path in the container.
+//
+// configDirPath is the harness-config directory containing capture_auth.py.
+// authMeta provides the required_files declarations used to generate the
+// capture-auth-config.json input.
+func StageCaptureAuthAssets(agentHome, configDirPath string, authMeta *config.HarnessAuthMetadata) error {
+	bundleDir := filepath.Join(agentHome, ".scion", "harness")
+	inputsDir := filepath.Join(bundleDir, "inputs")
+
+	for _, dir := range []string{bundleDir, inputsDir} {
+		if err := os.MkdirAll(dir, 0755); err != nil {
+			return fmt.Errorf("create dir %q: %w", dir, err)
+		}
+	}
+
+	captureAuthSrc := filepath.Join(configDirPath, "capture_auth.py")
+	if fileExistsHelper(captureAuthSrc) {
+		dst := filepath.Join(bundleDir, "capture_auth.py")
+		if err := copyHarnessConfigFile(captureAuthSrc, dst); err != nil {
+			return fmt.Errorf("stage capture_auth.py: %w", err)
+		}
+		if err := os.Chmod(dst, 0755); err != nil {
+			return fmt.Errorf("chmod capture_auth.py: %w", err)
+		}
+	}
+
+	if authMeta == nil || len(authMeta.Types) == 0 {
+		return nil
+	}
+
+	type credEntry struct {
+		Key    string `json:"key"`
+		Source string `json:"source"`
+		Type   string `json:"type"`
+		Target string `json:"target"`
+	}
+
+	var creds []credEntry
+	for _, authType := range authMeta.Types {
+		for _, rf := range authType.RequiredFiles {
+			// Entries with empty TargetSuffix (e.g. gcloud-adc) are intentionally
+			// excluded — these credentials come from well-known system paths and don't
+			// use the suffix-based source derivation.
+			if rf.Name == "" || rf.TargetSuffix == "" {
+				continue
+			}
+			fileType := rf.Type
+			if fileType == "" {
+				fileType = "file"
+			}
+			suffix := rf.TargetSuffix
+			if !strings.HasPrefix(suffix, "/") {
+				suffix = "/" + suffix
+			}
+			source := "~" + suffix
+			creds = append(creds, credEntry{
+				Key:    rf.Name,
+				Source: source,
+				Type:   fileType,
+				Target: source,
+			})
+		}
+	}
+
+	if len(creds) == 0 {
+		return nil
+	}
+
+	sort.Slice(creds, func(i, j int) bool { return creds[i].Key < creds[j].Key })
+
+	payload := map[string]interface{}{
+		"schema_version": 1,
+		"credentials":    creds,
+	}
+	data, err := json.MarshalIndent(payload, "", "  ")
+	if err != nil {
+		return fmt.Errorf("marshal capture-auth config: %w", err)
+	}
+	return os.WriteFile(filepath.Join(inputsDir, "capture-auth-config.json"), data, 0644)
 }

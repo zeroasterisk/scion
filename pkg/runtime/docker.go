@@ -24,6 +24,7 @@ import (
 
 	"github.com/GoogleCloudPlatform/scion/pkg/api"
 	"github.com/GoogleCloudPlatform/scion/pkg/gcp"
+	"github.com/GoogleCloudPlatform/scion/pkg/projectcompat"
 	"github.com/GoogleCloudPlatform/scion/pkg/util"
 )
 
@@ -173,12 +174,12 @@ func (r *DockerRuntime) List(ctx context.Context, labelFilter map[string]string)
 			// Fallback for project labels
 			if actual == "" {
 				switch k {
-				case "scion.project":
-					actual = labels["scion.grove"]
-				case "scion.project_id":
-					actual = labels["scion.grove_id"]
-				case "scion.project_path":
-					actual = labels["scion.grove_path"]
+				case projectcompat.LabelProject:
+					actual = projectcompat.ProjectNameFromLabels(labels)
+				case projectcompat.LabelProjectID:
+					actual = projectcompat.ProjectIDFromLabels(labels)
+				case projectcompat.LabelProjectPath:
+					actual = projectcompat.ProjectPathFromLabels(labels)
 				}
 			}
 
@@ -205,25 +206,10 @@ func (r *DockerRuntime) List(ctx context.Context, labelFilter map[string]string)
 				Template:        labels["scion.template"],
 				HarnessConfig:   labels["scion.harness_config"],
 				HarnessAuth:     labels["scion.harness_auth"],
-				Project: func() string {
-					if p := labels["scion.project"]; p != "" {
-						return p
-					}
-					return labels["scion.grove"]
-				}(),
-				ProjectID: func() string {
-					if p := labels["scion.project_id"]; p != "" {
-						return p
-					}
-					return labels["scion.grove_id"]
-				}(),
-				ProjectPath: func() string {
-					if p := labels["scion.project_path"]; p != "" {
-						return p
-					}
-					return labels["scion.grove_path"]
-				}(),
-				Runtime: r.Name(),
+				Project:         projectcompat.ProjectNameFromLabels(labels),
+				ProjectID:       projectcompat.ProjectIDFromLabels(labels),
+				ProjectPath:     projectcompat.ProjectPathFromLabels(labels),
+				Runtime:         r.Name(),
 			})
 		}
 	}

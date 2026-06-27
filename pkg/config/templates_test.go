@@ -431,6 +431,37 @@ func TestLoadConfigInvalidVolumes(t *testing.T) {
 		}
 	})
 
+	t.Run("valid nfs volume", func(t *testing.T) {
+		tmpDir, err := os.MkdirTemp("", "scion-test-nfs-volumes-*")
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer os.RemoveAll(tmpDir)
+
+		configContent := `{
+			"harness": "gemini",
+			"volumes": [{"source": "/scion-workspaces", "target": "/workspace", "type": "nfs", "server": "10.0.0.2"}]
+		}`
+		if err := os.WriteFile(filepath.Join(tmpDir, "scion-agent.json"), []byte(configContent), 0644); err != nil {
+			t.Fatal(err)
+		}
+
+		tpl := &Template{Path: tmpDir}
+		cfg, err := tpl.LoadConfig()
+		if err != nil {
+			t.Fatalf("LoadConfig() unexpected error for valid nfs volume: %v", err)
+		}
+		if len(cfg.Volumes) != 1 {
+			t.Fatalf("LoadConfig() expected 1 volume, got %d", len(cfg.Volumes))
+		}
+		if cfg.Volumes[0].Type != "nfs" {
+			t.Errorf("Volume type = %q, want %q", cfg.Volumes[0].Type, "nfs")
+		}
+		if cfg.Volumes[0].Server != "10.0.0.2" {
+			t.Errorf("Volume server = %q, want %q", cfg.Volumes[0].Server, "10.0.0.2")
+		}
+	})
+
 	t.Run("volume with invalid type", func(t *testing.T) {
 		tmpDir, err := os.MkdirTemp("", "scion-test-invalid-volumes-*")
 		if err != nil {
@@ -440,7 +471,7 @@ func TestLoadConfigInvalidVolumes(t *testing.T) {
 
 		configContent := `{
 			"harness": "gemini",
-			"volumes": [{"source": "/foo", "target": "/bar", "type": "nfs"}]
+			"volumes": [{"source": "/foo", "target": "/bar", "type": "bogus"}]
 		}`
 		if err := os.WriteFile(filepath.Join(tmpDir, "scion-agent.json"), []byte(configContent), 0644); err != nil {
 			t.Fatal(err)
@@ -1845,6 +1876,65 @@ func TestResolveContentInChain(t *testing.T) {
 		}
 		if content != nil {
 			t.Errorf("expected nil for empty field, got %q", string(content))
+		}
+	})
+}
+
+func TestMergeScionConfig_Skills(t *testing.T) {
+	t.Run("base has skills, override has none", func(t *testing.T) {
+		base := &api.ScionConfig{
+			Skills: []api.SkillReference{
+				{URI: "skill://scion/core/scion@^1.0"},
+			},
+		}
+		override := &api.ScionConfig{}
+		got := MergeScionConfig(base, override)
+		if len(got.Skills) != 1 {
+			t.Fatalf("expected 1 skill, got %d", len(got.Skills))
+		}
+		if got.Skills[0].URI != "skill://scion/core/scion@^1.0" {
+			t.Errorf("expected base skill preserved, got %q", got.Skills[0].URI)
+		}
+	})
+
+	t.Run("both have skills - concatenated", func(t *testing.T) {
+		base := &api.ScionConfig{
+			Skills: []api.SkillReference{
+				{URI: "skill://scion/core/scion@^1.0"},
+			},
+		}
+		override := &api.ScionConfig{
+			Skills: []api.SkillReference{
+				{URI: "skill://scion/core/security-audit@latest", Optional: true},
+			},
+		}
+		got := MergeScionConfig(base, override)
+		if len(got.Skills) != 2 {
+			t.Fatalf("expected 2 skills, got %d", len(got.Skills))
+		}
+		if got.Skills[0].URI != "skill://scion/core/scion@^1.0" {
+			t.Errorf("first skill = %q, want base skill", got.Skills[0].URI)
+		}
+		if got.Skills[1].URI != "skill://scion/core/security-audit@latest" {
+			t.Errorf("second skill = %q, want override skill", got.Skills[1].URI)
+		}
+		if !got.Skills[1].Optional {
+			t.Error("expected second skill to be optional")
+		}
+	})
+
+	t.Run("base nil, override has skills", func(t *testing.T) {
+		override := &api.ScionConfig{
+			Skills: []api.SkillReference{
+				{URI: "scion", As: "my-scion"},
+			},
+		}
+		got := MergeScionConfig(nil, override)
+		if len(got.Skills) != 1 {
+			t.Fatalf("expected 1 skill, got %d", len(got.Skills))
+		}
+		if got.Skills[0].As != "my-scion" {
+			t.Errorf("expected As field preserved, got %q", got.Skills[0].As)
 		}
 	})
 }

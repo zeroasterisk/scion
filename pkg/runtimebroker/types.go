@@ -286,6 +286,8 @@ type CreateAgentRequest struct {
 	// CreatorName is the human-readable identity of who created this agent.
 	// Injected as the SCION_CREATOR environment variable in the agent container.
 	CreatorName string `json:"creatorName,omitempty"`
+	// NoAuth indicates the agent should start without any injected credentials.
+	NoAuth bool `json:"noAuth,omitempty"`
 	// Attach indicates the agent should start in interactive attach mode (not detached).
 	Attach bool `json:"attach,omitempty"`
 	// ProvisionOnly indicates the agent should be provisioned (dirs, worktree, templates)
@@ -321,6 +323,11 @@ type CreateAgentRequest struct {
 	// Resolved by the Hub from the project record and passed to the broker
 	// so it can provision host-side directories and inject volume mounts.
 	SharedDirs []api.SharedDir `json:"sharedDirs,omitempty"`
+
+	// WorkspaceMode is the resolved workspace sharing mode for the project
+	// (e.g. "shared", "per-agent", "worktree-per-agent"). Threaded from the
+	// Hub so the broker can branch dispatch without re-deriving from labels.
+	WorkspaceMode string `json:"workspaceMode,omitempty"`
 }
 
 // UnmarshalJSON implements custom unmarshaling to support legacy grove fields.
@@ -510,6 +517,16 @@ func (r MessageRequest) MarshalJSON() ([]byte, error) {
 type ExecRequest struct {
 	Command []string `json:"command"`
 	Timeout int      `json:"timeout,omitempty"` // Timeout in seconds
+}
+
+// ResetAuthRequest is the request body for resetting auth on a running agent.
+type ResetAuthRequest struct {
+	Token string `json:"token"`
+}
+
+// ResetAuthResponse is the response for auth reset.
+type ResetAuthResponse struct {
+	Message string `json:"message"`
 }
 
 // ExecResponse is the response for command execution.

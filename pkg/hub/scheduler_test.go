@@ -79,10 +79,8 @@ func TestSchedulerTickZero(t *testing.T) {
 
 	// Wait for tick-0 handler to execute
 	deadline := time.After(500 * time.Millisecond)
-	for {
-		if called.Load() > 0 {
-			break
-		}
+	for called.Load() <= 0 {
+
 		select {
 		case <-deadline:
 			t.Fatal("tick-zero handler was not invoked within timeout")
@@ -481,7 +479,7 @@ func TestOneShotTimerFiresAtCorrectTime(t *testing.T) {
 		Payload:   "{}",
 		Status:    store.ScheduledEventPending,
 	}
-	ms.CreateScheduledEvent(ctx, &evt)
+	_ = ms.CreateScheduledEvent(ctx, &evt)
 
 	// scheduleTimer directly to test the timer mechanism
 	s.scheduleTimer(ctx, evt)
@@ -533,7 +531,7 @@ func TestOneShotExpiredTimerFiresImmediately(t *testing.T) {
 		Payload:   "{}",
 		Status:    store.ScheduledEventPending,
 	}
-	ms.CreateScheduledEvent(ctx, &evt)
+	_ = ms.CreateScheduledEvent(ctx, &evt)
 
 	s := newTestSchedulerWithStore(1*time.Second, ms)
 	s.RegisterEventHandler("message", func(_ context.Context, _ store.ScheduledEvent) error {
@@ -582,7 +580,7 @@ func TestOneShotTimerCancellation(t *testing.T) {
 		Payload:   "{}",
 		Status:    store.ScheduledEventPending,
 	}
-	ms.CreateScheduledEvent(ctx, &evt)
+	_ = ms.CreateScheduledEvent(ctx, &evt)
 
 	// Schedule the timer
 	s.scheduleTimer(ctx, evt)
@@ -675,7 +673,7 @@ func TestStopCancelsAllOneShotTimers(t *testing.T) {
 			Payload:   "{}",
 			Status:    store.ScheduledEventPending,
 		}
-		ms.CreateScheduledEvent(ctx, &evt)
+		_ = ms.CreateScheduledEvent(ctx, &evt)
 		s.scheduleTimer(ctx, evt)
 	}
 
@@ -718,7 +716,7 @@ func TestOneShotHandlerPanicRecovery(t *testing.T) {
 		Payload:   "{}",
 		Status:    store.ScheduledEventPending,
 	}
-	ms.CreateScheduledEvent(ctx, &evt)
+	_ = ms.CreateScheduledEvent(ctx, &evt)
 
 	// Fire the event directly
 	s.fireEvent(ctx, evt, false)
@@ -748,7 +746,7 @@ func TestOneShotUnknownEventTypeReturnsError(t *testing.T) {
 		Payload:   "{}",
 		Status:    store.ScheduledEventPending,
 	}
-	ms.CreateScheduledEvent(ctx, &evt)
+	_ = ms.CreateScheduledEvent(ctx, &evt)
 
 	// Fire the event directly
 	s.fireEvent(ctx, evt, false)
@@ -820,7 +818,7 @@ func TestRegisterEventHandlerAndDispatch(t *testing.T) {
 		Payload:   `{"msg":"hello"}`,
 		Status:    store.ScheduledEventPending,
 	}
-	ms.CreateScheduledEvent(ctx, &evt)
+	_ = ms.CreateScheduledEvent(ctx, &evt)
 
 	s.fireEvent(ctx, evt, false)
 
@@ -861,7 +859,7 @@ func TestEventHandlerErrorIsCaptured(t *testing.T) {
 		Payload:   "{}",
 		Status:    store.ScheduledEventPending,
 	}
-	ms.CreateScheduledEvent(ctx, &evt)
+	_ = ms.CreateScheduledEvent(ctx, &evt)
 
 	s.fireEvent(ctx, evt, false)
 
@@ -890,7 +888,7 @@ func TestUnregisteredEventTypeReturnsError(t *testing.T) {
 		Payload:   "{}",
 		Status:    store.ScheduledEventPending,
 	}
-	ms.CreateScheduledEvent(ctx, &evt)
+	_ = ms.CreateScheduledEvent(ctx, &evt)
 
 	s.fireEvent(ctx, evt, false)
 
@@ -986,7 +984,7 @@ func TestExpiredEventsFromDowntimeStillFire(t *testing.T) {
 			Payload:   `{"msg":"recover me"}`,
 			Status:    store.ScheduledEventPending,
 		}
-		ms.CreateScheduledEvent(ctx, &evt)
+		_ = ms.CreateScheduledEvent(ctx, &evt)
 	}
 
 	s := newTestSchedulerWithStore(1*time.Second, ms)
@@ -1002,10 +1000,8 @@ func TestExpiredEventsFromDowntimeStillFire(t *testing.T) {
 
 	// Wait for all expired events to fire
 	deadline := time.After(1 * time.Second)
-	for {
-		if fired.Load() >= 3 {
-			break
-		}
+	for fired.Load() < 3 {
+
 		select {
 		case <-deadline:
 			t.Fatalf("expected 3 expired events to fire, got %d", fired.Load())
@@ -1027,55 +1023,67 @@ func TestExpiredEventsFromDowntimeStillFire(t *testing.T) {
 
 func TestMessageEventHandler_AgentNotFound(t *testing.T) {
 	// When a message event fires for an agent that has been deleted,
-	// the handler should return a clear error indicating the agent
-	// no longer exists (not a generic "failed to resolve" error).
+	// the handler should mark the event as failed (not return an error
+	// that would be stored with the wrong status).
 	ms := newMockStore()
 
-	// Create a Server with the mock store — no agents registered
-	srv := &Server{store: ms}
-	handler := srv.messageEventHandler()
-
+	// Create the event in the mock store so UpdateScheduledEventStatus finds it.
 	ctx := context.Background()
-
 	evt := store.ScheduledEvent{
 		ID:        "msg-no-agent-1",
 		ProjectID: "project-1",
 		EventType: "message",
 		Payload:   `{"agentName":"deleted-agent","message":"hello?"}`,
+		Status:    store.ScheduledEventPending,
 	}
+	_ = ms.CreateScheduledEvent(ctx, &evt)
+
+	// Create a Server with the mock store — no agents registered
+	srv := &Server{store: ms}
+	handler := srv.messageEventHandler()
 
 	err := handler(ctx, evt)
-	if err == nil {
-		t.Fatal("expected error when agent does not exist")
+	if err != nil {
+		t.Fatalf("handler should return nil for deleted agents (handles failure internally), got: %s", err)
 	}
-	if !strings.Contains(err.Error(), "no longer exists") {
-		t.Errorf("expected 'no longer exists' in error, got: %s", err)
+
+	// Verify the event was marked as failed.
+	e := ms.getEvent("msg-no-agent-1")
+	if e.Status != store.ScheduledEventFailed {
+		t.Errorf("expected status %q, got %q", store.ScheduledEventFailed, e.Status)
 	}
-	if !strings.Contains(err.Error(), "deleted-agent") {
-		t.Errorf("expected agent name in error, got: %s", err)
+	if e.Error != "target agent deleted" {
+		t.Errorf("expected error %q, got %q", "target agent deleted", e.Error)
 	}
 }
 
 func TestMessageEventHandler_AgentNotFoundByID(t *testing.T) {
 	ms := newMockStore()
-	srv := &Server{store: ms}
-	handler := srv.messageEventHandler()
 
 	ctx := context.Background()
-
 	evt := store.ScheduledEvent{
 		ID:        "msg-no-agent-2",
 		ProjectID: "project-1",
 		EventType: "message",
 		Payload:   `{"agentId":"nonexistent-id","message":"hello?"}`,
+		Status:    store.ScheduledEventPending,
 	}
+	_ = ms.CreateScheduledEvent(ctx, &evt)
+
+	srv := &Server{store: ms}
+	handler := srv.messageEventHandler()
 
 	err := handler(ctx, evt)
-	if err == nil {
-		t.Fatal("expected error when agent does not exist")
+	if err != nil {
+		t.Fatalf("handler should return nil for deleted agents (handles failure internally), got: %s", err)
 	}
-	if !strings.Contains(err.Error(), "no longer exists") {
-		t.Errorf("expected 'no longer exists' in error, got: %s", err)
+
+	e := ms.getEvent("msg-no-agent-2")
+	if e.Status != store.ScheduledEventFailed {
+		t.Errorf("expected status %q, got %q", store.ScheduledEventFailed, e.Status)
+	}
+	if e.Error != "target agent deleted" {
+		t.Errorf("expected error %q, got %q", "target agent deleted", e.Error)
 	}
 }
 
@@ -1106,7 +1114,7 @@ func TestMultipleEventHandlers(t *testing.T) {
 		Payload:   "{}",
 		Status:    store.ScheduledEventPending,
 	}
-	ms.CreateScheduledEvent(ctx, &msgEvt)
+	_ = ms.CreateScheduledEvent(ctx, &msgEvt)
 	s.fireEvent(ctx, msgEvt, false)
 
 	// Fire a status_update event
@@ -1118,7 +1126,7 @@ func TestMultipleEventHandlers(t *testing.T) {
 		Payload:   "{}",
 		Status:    store.ScheduledEventPending,
 	}
-	ms.CreateScheduledEvent(ctx, &statusEvt)
+	_ = ms.CreateScheduledEvent(ctx, &statusEvt)
 	s.fireEvent(ctx, statusEvt, false)
 
 	if got := messageCalled.Load(); got != 1 {
@@ -1263,5 +1271,97 @@ func TestDispatchAgentEventHandler_CreatesAgentNoDispatcher(t *testing.T) {
 	}
 	if !found {
 		t.Error("agent was not created in the store")
+	}
+}
+
+// ============================================================================
+// Singleton Guard Tests (advisory-lock leader election)
+// ============================================================================
+
+// lockerStore is a minimal store that also implements store.AdvisoryLocker so
+// the singleton guard's lock-acquisition branches can be exercised in isolation.
+type lockerStore struct {
+	store.Store // embedded; unused methods panic if called
+
+	acquired bool
+	err      error
+	released *atomic.Int32
+}
+
+func (l *lockerStore) TryAdvisoryLock(_ context.Context, _ store.AdvisoryLockKey) (bool, func() error, error) {
+	if l.err != nil {
+		return false, func() error { return nil }, l.err
+	}
+	return l.acquired, func() error {
+		if l.released != nil {
+			l.released.Add(1)
+		}
+		return nil
+	}, nil
+}
+
+func (l *lockerStore) TryAdvisoryLockObject(_ context.Context, _ store.AdvisoryLockKey, _ int32) (bool, func() error, error) {
+	if l.err != nil {
+		return false, func() error { return nil }, l.err
+	}
+	return l.acquired, func() error {
+		if l.released != nil {
+			l.released.Add(1)
+		}
+		return nil
+	}, nil
+}
+
+// TestSingletonGuard_SkipsTickOnLockError verifies that a lock-acquisition error
+// (e.g. a connection timeout) causes the tick to be SKIPPED rather than running
+// the handler unguarded — running unguarded would let multiple replicas execute
+// the same singleton work concurrently.
+func TestSingletonGuard_SkipsTickOnLockError(t *testing.T) {
+	s := NewScheduler(&lockerStore{err: fmt.Errorf("connection timeout")}, slog.Default())
+
+	var ran atomic.Int32
+	guarded := s.singletonGuard("test", store.LockSoftDeletePurge, func(_ context.Context) {
+		ran.Add(1)
+	})
+	guarded(context.Background())
+
+	if got := ran.Load(); got != 0 {
+		t.Fatalf("handler ran %d times on lock error; expected 0 (tick must be skipped, not run unguarded)", got)
+	}
+}
+
+// TestSingletonGuard_RunsWhenAcquired verifies the handler runs and the lock is
+// released when acquisition succeeds.
+func TestSingletonGuard_RunsWhenAcquired(t *testing.T) {
+	var released atomic.Int32
+	s := NewScheduler(&lockerStore{acquired: true, released: &released}, slog.Default())
+
+	var ran atomic.Int32
+	guarded := s.singletonGuard("test", store.LockSoftDeletePurge, func(_ context.Context) {
+		ran.Add(1)
+	})
+	guarded(context.Background())
+
+	if got := ran.Load(); got != 1 {
+		t.Fatalf("handler ran %d times; expected 1", got)
+	}
+	if got := released.Load(); got != 1 {
+		t.Fatalf("lock released %d times; expected 1", got)
+	}
+}
+
+// TestSingletonGuard_SkipsWhenHeldByAnother verifies the handler does NOT run
+// when another replica holds the lock (acquired=false, no error).
+func TestSingletonGuard_SkipsWhenHeldByAnother(t *testing.T) {
+	s := NewScheduler(&lockerStore{acquired: false}, slog.Default())
+
+	var ran atomic.Int32
+	guarded := s.singletonGuard("test", store.LockSoftDeletePurge, func(_ context.Context) {
+		ran.Add(1)
+	})
+	guarded(context.Background())
+
+	if got := ran.Load(); got != 0 {
+		t.Fatalf("handler ran %d times while lock held by another replica; expected 0", got)
 	}
 }

@@ -70,8 +70,58 @@ export class ScionPageHarnessConfigDetail extends LitElement {
   @state()
   private editorInitialPreview = false;
 
+  @state()
+  private hasDockerfile = false;
+
+  @state()
+  private buildDialogOpen = false;
+
+  @state()
+  private buildRunning = false;
+
+  @state()
+  private buildTag = 'latest';
+
+  @state()
+  private buildPush = false;
+
+  @state()
+  private buildLog = '';
+
+  @state()
+  private buildStatus = '';
+
+  @state()
+  private buildRunId = '';
+
+  @state()
+  private buildError = '';
+
+  @state()
+  private reimportRunning = false;
+
+  @state()
+  private reimportStatus = '';
+
+  @state()
+  private reimportError = '';
+
+  @state()
+  private deleteDialogOpen = false;
+
+  @state()
+  private deleteInProgress = false;
+
+  @state()
+  private deleteFiles = false;
+
+  @state()
+  private deleteError = '';
+
   private fileBrowserDataSource: FileBrowserDataSource | null = null;
   private fileEditorDataSource: FileEditorDataSource | null = null;
+  private buildPollTimer: ReturnType<typeof setTimeout> | null = null;
+  private buildPollErrors = 0;
 
   static override styles = css`
     :host {
@@ -155,6 +205,132 @@ export class ScionPageHarnessConfigDetail extends LitElement {
       margin-bottom: 0.5rem;
     }
 
+    .header-actions {
+      margin-left: auto;
+    }
+
+    .build-log-section {
+      margin-top: 1.5rem;
+    }
+    .build-log-section h3 {
+      font-size: 0.95rem;
+      font-weight: 600;
+      margin: 0 0 0.5rem;
+      display: flex;
+      align-items: center;
+      gap: 0.5rem;
+    }
+    .build-log {
+      background: var(--sl-color-neutral-50);
+      border: 1px solid var(--sl-color-neutral-200);
+      border-radius: var(--sl-border-radius-medium);
+      padding: 1rem;
+      font-family: var(--sl-font-mono);
+      font-size: 0.8rem;
+      line-height: 1.5;
+      white-space: pre-wrap;
+      word-break: break-all;
+      max-height: 400px;
+      overflow-y: auto;
+    }
+
+    .build-status-badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 0.25rem;
+      font-size: 0.75rem;
+      font-weight: 500;
+    }
+    .build-status-badge.running { color: var(--sl-color-primary-600); }
+    .build-status-badge.completed { color: var(--sl-color-success-600); }
+    .build-status-badge.failed { color: var(--sl-color-danger-600); }
+
+    .source-url {
+      display: inline-flex;
+      align-items: center;
+      gap: 0.25rem;
+    }
+    .source-url a {
+      color: var(--sl-color-primary-600);
+      text-decoration: none;
+    }
+    .source-url a:hover {
+      text-decoration: underline;
+    }
+    .reimport-status {
+      font-size: 0.85rem;
+      margin-top: 0.5rem;
+    }
+    .reimport-status.success { color: var(--sl-color-success-600); }
+    .reimport-status.error { color: var(--sl-color-danger-600); }
+
+    .build-error {
+      color: var(--sl-color-danger-600);
+      font-size: 0.85rem;
+      margin-top: 0.5rem;
+    }
+
+    .image-section {
+      margin-top: 1.5rem;
+    }
+    .image-section h2 {
+      font-size: 1.1rem;
+      font-weight: 600;
+      margin: 0 0 1rem;
+    }
+    .image-info {
+      display: flex;
+      align-items: center;
+      gap: 1rem;
+      padding: 0.75rem 1rem;
+      background: var(--sl-color-neutral-50);
+      border: 1px solid var(--sl-color-neutral-200);
+      border-radius: var(--sl-border-radius-medium);
+      flex-wrap: wrap;
+    }
+    .image-path {
+      font-family: var(--sl-font-mono);
+      font-size: 0.8125rem;
+      word-break: break-all;
+      flex: 1;
+      min-width: 0;
+    }
+    .image-type-badge {
+      display: inline-block;
+      padding: 0.125rem 0.5rem;
+      border-radius: var(--sl-border-radius-pill);
+      font-size: 0.6875rem;
+      font-weight: 600;
+      text-transform: uppercase;
+      white-space: nowrap;
+    }
+    .image-type-badge.local {
+      background: var(--sl-color-neutral-100);
+      color: var(--sl-color-neutral-700);
+    }
+    .image-type-badge.remote {
+      background: var(--sl-color-primary-50);
+      color: var(--sl-color-primary-700);
+    }
+    .image-meta {
+      font-size: 0.75rem;
+      color: var(--sl-color-neutral-500);
+    }
+
+    .dialog-warning {
+      display: flex;
+      align-items: center;
+      gap: 0.5rem;
+      font-size: 0.8125rem;
+      color: var(--sl-color-danger-600);
+      margin-top: 0.75rem;
+    }
+    .dialog-error {
+      color: var(--sl-color-danger-600);
+      font-size: 0.8125rem;
+      margin-top: 0.5rem;
+    }
+
     .error-state,
     .loading-state {
       text-align: center;
@@ -214,6 +390,7 @@ export class ScionPageHarnessConfigDetail extends LitElement {
         throw new Error(await extractApiError(response, `HTTP ${response.status}`));
       }
       this.harnessConfig = (await response.json()) as HarnessConfig;
+      this.hasDockerfile = this.harnessConfig.files?.some(f => f.path === 'Dockerfile') ?? false;
       dispatchPageTitle(
         this,
         this.harnessConfig.displayName || this.harnessConfig.name || this.harnessConfigId,
@@ -293,7 +470,7 @@ export class ScionPageHarnessConfigDetail extends LitElement {
         )}
       </div>
 
-      ${this.renderHeader()} ${this.renderFilesSection()}
+      ${this.renderHeader()} ${this.renderFilesSection()} ${this.renderImageSection()} ${this.renderBuildDialog()} ${this.renderBuildLog()} ${this.renderDeleteDialog()}
     `;
   }
 
@@ -308,6 +485,31 @@ export class ScionPageHarnessConfigDetail extends LitElement {
           ></sl-icon>
           <h1>${hc.displayName || hc.name}</h1>
           ${hc.harness ? html`<span class="harness-badge">${hc.harness}</span>` : ''}
+          <div class="header-actions">
+            ${hc.sourceUrl ? html`
+              <sl-button
+                size="small"
+                variant="default"
+                @click=${this.startReimport}
+                ?disabled=${this.reimportRunning}
+                ?loading=${this.reimportRunning}
+              >
+                <sl-icon slot="prefix" name="arrow-repeat"></sl-icon>
+                Refresh from Source
+              </sl-button>
+            ` : nothing}
+            ${can(hc._capabilities, 'delete') || can(hc._capabilities, 'manage') ? html`
+              <sl-button
+                size="small"
+                variant="danger"
+                outline
+                @click=${() => { this.deleteDialogOpen = true; this.deleteError = ''; }}
+              >
+                <sl-icon slot="prefix" name="trash"></sl-icon>
+                Delete
+              </sl-button>
+            ` : nothing}
+          </div>
         </div>
         ${hc.description ? html`<p class="resource-description">${hc.description}</p>` : ''}
         <div class="resource-meta-row">
@@ -319,7 +521,14 @@ export class ScionPageHarnessConfigDetail extends LitElement {
                 <scion-hash-display .hash=${hc.contentHash} max-width="14ch"></scion-hash-display
               ></span>`
             : ''}
+          ${hc.sourceUrl
+            ? html`<span class="source-url">Source:
+                <a href=${hc.sourceUrl} target="_blank" rel="noopener">${hc.sourceUrl}</a>
+              </span>`
+            : ''}
         </div>
+        ${this.reimportStatus ? html`<p class="reimport-status success">${this.reimportStatus}</p>` : ''}
+        ${this.reimportError ? html`<p class="reimport-status error">${this.reimportError}</p>` : ''}
       </div>
     `;
   }
@@ -360,6 +569,340 @@ export class ScionPageHarnessConfigDetail extends LitElement {
             `}
       </div>
     `;
+  }
+  private isRemoteImage(image: string): boolean {
+    return image.includes('/') && (image.includes('.') || image.includes(':'));
+  }
+
+  private renderImageSection() {
+    const hc = this.harnessConfig!;
+    const image = hc.config?.image;
+    const showSection = image || this.hasDockerfile;
+    if (!showSection) return nothing;
+
+    const isRemote = image ? this.isRemoteImage(image) : false;
+
+    return html`
+      <div class="image-section">
+        <h2>Image</h2>
+        <div class="image-info">
+          ${image ? html`
+            <span class="image-type-badge ${isRemote ? 'remote' : 'local'}">
+              ${isRemote ? 'Remote' : 'Local'}
+            </span>
+            <span class="image-path">${image}</span>
+          ` : html`
+            <span class="image-meta">No image configured</span>
+          `}
+          ${hc.updated ? html`
+            <span class="image-meta">Last updated: ${new Date(hc.updated).toLocaleString('en-US', { month: 'short', day: 'numeric', year: 'numeric', hour: 'numeric', minute: '2-digit' })}</span>
+          ` : nothing}
+          ${this.hasDockerfile ? html`
+            <sl-button
+              size="small"
+              variant="primary"
+              @click=${this.openBuildDialog}
+              ?disabled=${this.buildRunning}
+            >
+              <sl-icon slot="prefix" name="hammer"></sl-icon>
+              ${this.buildRunning ? 'Building...' : 'Build Image'}
+            </sl-button>
+          ` : nothing}
+        </div>
+      </div>
+    `;
+  }
+
+  // ── Refresh from Source ──
+
+  private async startReimport(): Promise<void> {
+    if (!this.harnessConfig?.id) return;
+    this.reimportRunning = true;
+    this.reimportStatus = '';
+    this.reimportError = '';
+
+    try {
+      const response = await apiFetch(
+        `/api/v1/harness-configs/${this.harnessConfig.id}/reimport`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({}),
+        },
+      );
+
+      if (!response.ok) {
+        const errMsg = await extractApiError(response, `HTTP ${response.status}`);
+        this.reimportError = errMsg;
+        return;
+      }
+
+      const result = await response.json();
+      const count = result?.count ?? result?.harnessConfigs?.length ?? 0;
+      this.reimportStatus = `Refreshed successfully (${count} config${count !== 1 ? 's' : ''} updated).`;
+      await this.loadHarnessConfig();
+    } catch (err) {
+      this.reimportError = err instanceof Error ? err.message : 'Failed to refresh from source';
+    } finally {
+      this.reimportRunning = false;
+    }
+  }
+
+  // ── Build Image ──
+
+  private openBuildDialog(): void {
+    this.buildTag = 'latest';
+    this.buildPush = false;
+    this.buildError = '';
+    this.buildDialogOpen = true;
+  }
+
+  private renderBuildDialog() {
+    return html`
+      <sl-dialog
+        label="Build Image"
+        ?open=${this.buildDialogOpen}
+        @sl-request-close=${() => (this.buildDialogOpen = false)}
+      >
+        <sl-input
+          label="Image Tag"
+          .value=${this.buildTag}
+          @sl-input=${(e: Event) => (this.buildTag = (e.target as HTMLInputElement).value)}
+        ></sl-input>
+        <br />
+        <sl-checkbox ?checked=${this.buildPush} @sl-change=${(e: Event) => (this.buildPush = (e.target as HTMLInputElement).checked)}>
+          Push to registry after building
+        </sl-checkbox>
+        ${this.buildError ? html`<p class="build-error">${this.buildError}</p>` : nothing}
+        <sl-button slot="footer" variant="primary" @click=${this.startBuild} ?loading=${this.buildRunning}>
+          Build
+        </sl-button>
+        <sl-button slot="footer" variant="default" @click=${() => (this.buildDialogOpen = false)}>
+          Cancel
+        </sl-button>
+      </sl-dialog>
+    `;
+  }
+
+  private async startBuild(): Promise<void> {
+    this.buildDialogOpen = false;
+    this.buildRunning = true;
+    this.buildLog = '';
+    this.buildStatus = 'running';
+    this.buildError = '';
+    this.buildPollErrors = 0;
+
+    try {
+      const response = await apiFetch(
+        '/api/v1/admin/maintenance/operations/build-harness-config-image/run',
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            params: {
+              harness_config_id: this.harnessConfigId,
+              tag: this.buildTag || 'latest',
+              push: this.buildPush ? 'true' : 'false',
+            },
+          }),
+        },
+      );
+
+      if (!response.ok) {
+        const errMsg = await extractApiError(response, `HTTP ${response.status}`);
+        this.buildError = errMsg;
+        this.buildRunning = false;
+        this.buildStatus = 'failed';
+        return;
+      }
+
+      const result = await response.json();
+      if (!result?.runId) {
+        this.buildError = 'Build started but no run ID was returned';
+        this.buildRunning = false;
+        this.buildStatus = 'failed';
+        return;
+      }
+      this.buildRunId = result.runId;
+      this.startBuildPolling();
+    } catch (err) {
+      this.buildError = err instanceof Error ? err.message : 'Failed to start build';
+      this.buildRunning = false;
+      this.buildStatus = 'failed';
+    }
+  }
+
+  private startBuildPolling(): void {
+    if (this.buildPollTimer) return;
+    this.buildPollErrors = 0;
+    void this.pollBuildStatus();
+  }
+
+  private stopBuildPolling(): void {
+    if (this.buildPollTimer) {
+      clearTimeout(this.buildPollTimer);
+      this.buildPollTimer = null;
+    }
+  }
+
+  private async pollBuildStatus(): Promise<void> {
+    if (!this.buildRunId) return;
+
+    try {
+      const resp = await apiFetch(
+        `/api/v1/admin/maintenance/operations/build-harness-config-image/runs/${this.buildRunId}`,
+      );
+      if (!resp.ok) {
+        this.buildPollErrors++;
+        if (this.buildPollErrors >= 5) {
+          this.buildRunning = false;
+          this.buildStatus = 'failed';
+          this.buildError = 'Lost connection to build';
+          this.stopBuildPolling();
+        } else if (this.buildRunning) {
+          this.buildPollTimer = setTimeout(() => void this.pollBuildStatus(), 3000);
+        }
+        return;
+      }
+
+      this.buildPollErrors = 0;
+      const run = await resp.json();
+      this.buildLog = run.log ?? '';
+      this.buildStatus = run.status ?? '';
+      void this.updateComplete.then(() => this.scrollBuildLog());
+
+      if (run.status !== 'running') {
+        this.buildRunning = false;
+        this.stopBuildPolling();
+        if (run.status === 'completed') {
+          await this.loadHarnessConfig();
+        }
+      } else if (this.buildRunning) {
+        this.buildPollTimer = setTimeout(() => void this.pollBuildStatus(), 3000);
+      }
+    } catch {
+      this.buildPollErrors++;
+      if (this.buildPollErrors >= 5) {
+        this.buildRunning = false;
+        this.buildStatus = 'failed';
+        this.buildError = 'Lost connection to build';
+        this.stopBuildPolling();
+      } else if (this.buildRunning) {
+        this.buildPollTimer = setTimeout(() => void this.pollBuildStatus(), 3000);
+      }
+    }
+  }
+
+  private scrollBuildLog(): void {
+    const el = this.renderRoot?.querySelector('.build-log');
+    if (el) {
+      el.scrollTop = el.scrollHeight;
+    }
+  }
+
+  private renderBuildLog() {
+    if (!this.buildLog && !this.buildRunning) return nothing;
+
+    const statusClass = this.buildStatus === 'completed' ? 'completed' : this.buildStatus === 'running' ? 'running' : 'failed';
+
+    return html`
+      <div class="build-log-section">
+        <h3>
+          Build Output
+          <span class="build-status-badge ${statusClass}">
+            ${this.buildStatus === 'running'
+              ? html`<sl-spinner style="font-size: 0.75rem;"></sl-spinner> Running`
+              : this.buildStatus}
+          </span>
+        </h3>
+        <pre class="build-log">${this.buildLog}</pre>
+      </div>
+    `;
+  }
+
+  // ── Delete ──
+
+  private renderDeleteDialog() {
+    if (!this.deleteDialogOpen || !this.harnessConfig) return nothing;
+    const hc = this.harnessConfig;
+    return html`
+      <sl-dialog
+        label="Delete harness config"
+        open
+        @sl-request-close=${(e: Event) => {
+          if (this.deleteInProgress) e.preventDefault();
+          else this.deleteDialogOpen = false;
+        }}
+      >
+        <p>
+          Are you sure you want to delete
+          <strong>${hc.displayName || hc.name}</strong>?
+        </p>
+        <sl-checkbox
+          ?checked=${this.deleteFiles}
+          @sl-change=${(e: Event) => {
+            this.deleteFiles = (e.target as HTMLInputElement).checked;
+          }}
+        >
+          Also delete stored files
+        </sl-checkbox>
+        <div class="dialog-warning">
+          <sl-icon name="exclamation-triangle"></sl-icon>
+          This action cannot be undone.
+        </div>
+        ${this.deleteError ? html`<div class="dialog-error">${this.deleteError}</div>` : nothing}
+        <div slot="footer">
+          <sl-button
+            variant="default"
+            size="small"
+            ?disabled=${this.deleteInProgress}
+            @click=${() => { this.deleteDialogOpen = false; }}
+          >
+            Cancel
+          </sl-button>
+          <sl-button
+            variant="danger"
+            size="small"
+            ?loading=${this.deleteInProgress}
+            ?disabled=${this.deleteInProgress}
+            @click=${() => this.confirmDelete()}
+          >
+            Delete
+          </sl-button>
+        </div>
+      </sl-dialog>
+    `;
+  }
+
+  private async confirmDelete(): Promise<void> {
+    if (!this.harnessConfig) return;
+    this.deleteInProgress = true;
+    this.deleteError = '';
+    try {
+      const params = new URLSearchParams({ deleteFiles: String(this.deleteFiles) });
+      const response = await apiFetch(
+        `/api/v1/harness-configs/${this.harnessConfig.id}?${params.toString()}`,
+        { method: 'DELETE' }
+      );
+      if (!response.ok) {
+        throw new Error(
+          await extractApiError(response, `Failed to delete: HTTP ${response.status}`)
+        );
+      }
+      this.deleteDialogOpen = false;
+      // Navigate back to the list view
+      const backLink = this.backLinks()[0];
+      window.location.href = backLink.href;
+    } catch (err) {
+      this.deleteError = err instanceof Error ? err.message : 'Delete failed';
+    } finally {
+      this.deleteInProgress = false;
+    }
+  }
+
+  override disconnectedCallback(): void {
+    super.disconnectedCallback();
+    this.stopBuildPolling();
   }
 }
 

@@ -15,6 +15,41 @@ import (
 	"testing"
 )
 
+// hubEnvVars lists the environment variables used by the Hub client.
+// Leaking these to a subprocess (e.g., sciontool init) causes the child
+// to talk to the real Hub and corrupt agent state. See issue #123.
+var hubEnvVars = []string{
+	"SCION_HUB_ENDPOINT",
+	"SCION_HUB_URL",
+	"SCION_AUTH_TOKEN",
+	"SCION_AGENT_ID",
+	"SCION_AGENT_MODE",
+}
+
+// scrubHubEnv clears all Hub-related environment variables for the
+// duration of the test, preventing accidental communication with a
+// real Hub when tests run inside an agent container.
+func scrubHubEnv(t *testing.T) {
+	t.Helper()
+	for _, key := range hubEnvVars {
+		t.Setenv(key, "")
+	}
+}
+
+// filterHubEnv returns a copy of the environment with all Hub-related
+// variables removed. Use when constructing exec.Cmd.Env to prevent
+// credential leakage to child processes.
+func filterHubEnv(env []string) []string {
+	var filtered []string
+	for _, e := range env {
+		key, _, _ := strings.Cut(e, "=")
+		if !slices.Contains(hubEnvVars, key) {
+			filtered = append(filtered, e)
+		}
+	}
+	return filtered
+}
+
 // TestInitProjectDataIsolation is a canary test that verifies sciontool source code
 // does NOT import the pkg/config package, which contains project path resolution logic.
 // This is a compile-time guarantee that in-container code cannot access project data paths.
@@ -135,14 +170,21 @@ func TestInitCommand_Integration(t *testing.T) {
 		t.Skip("skipping integration test in short mode")
 	}
 
+	// Clear Hub env vars so the subprocess cannot talk to the real Hub
+	// and corrupt agent state. See issue #123.
+	scrubHubEnv(t)
+
 	// Build sciontool if needed for integration testing
-	cmd := exec.Command("go", "build", "-buildvcs=false", "-o", "/tmp/sciontool-test", "../")
+	binPath := filepath.Join(t.TempDir(), "sciontool-test")
+	cmd := exec.Command("go", "build", "-buildvcs=false", "-o", binPath, "../")
 	if err := cmd.Run(); err != nil {
 		t.Skipf("failed to build sciontool for integration test: %v", err)
 	}
 
-	// Test running a simple command
-	testCmd := exec.Command("/tmp/sciontool-test", "init", "--", "echo", "hello")
+	// Test running a simple command — filter Hub env vars from the
+	// subprocess environment as belt-and-suspenders protection.
+	testCmd := exec.Command(binPath, "init", "--", "echo", "hello")
+	testCmd.Env = filterHubEnv(os.Environ())
 	output, err := testCmd.CombinedOutput()
 	if err != nil {
 		t.Errorf("init command failed: %v\nOutput: %s", err, output)
@@ -689,6 +731,41 @@ func TestWriteEnvFile_IncludesGitHubToken(t *testing.T) {
 
 	if !strings.Contains(string(data), `export GITHUB_TOKEN="ghp_test123"`) {
 		t.Errorf("expected GITHUB_TOKEN in env file, got:\n%s", string(data))
+	}
+}
+
+func TestWriteEnvFile_ReflectsUpdatedGitHubToken(t *testing.T) {
+	tmpHome := t.TempDir()
+
+	t.Setenv("GITHUB_TOKEN", "ghs_initial_token_abc123")
+
+	writeEnvFile(tmpHome, 0, 0)
+
+	envPath := filepath.Join(tmpHome, ".scion", "scion-env")
+	data, err := os.ReadFile(envPath)
+	if err != nil {
+		t.Fatalf("failed to read scion-env file: %v", err)
+	}
+	if !strings.Contains(string(data), `export GITHUB_TOKEN="ghs_initial_token_abc123"`) {
+		t.Fatalf("expected initial GITHUB_TOKEN in env file, got:\n%s", string(data))
+	}
+
+	// Simulate what StartGitHubTokenRefresh does: os.Setenv then OnRefreshed calls writeEnvFile
+	t.Setenv("GITHUB_TOKEN", "ghs_refreshed_token_xyz789")
+
+	writeEnvFile(tmpHome, 0, 0)
+
+	data, err = os.ReadFile(envPath)
+	if err != nil {
+		t.Fatalf("failed to read scion-env file after refresh: %v", err)
+	}
+	content := string(data)
+
+	if !strings.Contains(content, `export GITHUB_TOKEN="ghs_refreshed_token_xyz789"`) {
+		t.Errorf("expected refreshed GITHUB_TOKEN in env file, got:\n%s", content)
+	}
+	if strings.Contains(content, "ghs_initial_token_abc123") {
+		t.Errorf("stale initial token should not appear in env file after refresh")
 	}
 }
 

@@ -29,7 +29,7 @@ import (
 // passthrough is a simple handler that writes 200 OK.
 var passthrough = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
-	w.Write([]byte("OK"))
+	_, _ = w.Write([]byte("OK"))
 })
 
 // --- MaintenanceState unit tests ---
@@ -150,8 +150,8 @@ func TestAdminModeMiddleware_AgentIdentity(t *testing.T) {
 	mw := adminModeMiddleware(state)(passthrough)
 
 	agent := &agentIdentityWrapper{&AgentTokenClaims{
-		Claims:    jwt.Claims{Subject: "agent-1"},
-		ProjectID: "project-1",
+		Claims:    jwt.Claims{Subject: tid("agent-1")},
+		ProjectID: tid("project-1"),
 	}}
 	req := httptest.NewRequest(http.MethodGet, "/api/v1/agents", nil)
 	req = req.WithContext(contextWithIdentity(req.Context(), agent))
@@ -167,7 +167,7 @@ func TestAdminModeMiddleware_BrokerIdentity(t *testing.T) {
 	state := NewMaintenanceState(true, "")
 	mw := adminModeMiddleware(state)(passthrough)
 
-	broker := NewBrokerIdentity("broker-1")
+	broker := NewBrokerIdentity(tid("broker-1"))
 	req := httptest.NewRequest(http.MethodGet, "/api/v1/agents", nil)
 	ctx := contextWithIdentity(req.Context(), broker)
 	ctx = contextWithBrokerIdentity(ctx, broker)
@@ -450,7 +450,7 @@ func TestHandleAdminMaintenance_Get(t *testing.T) {
 	}
 
 	var body map[string]interface{}
-	json.NewDecoder(rr.Body).Decode(&body)
+	_ = json.NewDecoder(rr.Body).Decode(&body)
 	if body["enabled"] != false {
 		t.Errorf("expected enabled=false, got %v", body["enabled"])
 	}
@@ -477,7 +477,7 @@ func TestHandleAdminMaintenance_Put(t *testing.T) {
 	}
 
 	var body map[string]interface{}
-	json.NewDecoder(rr.Body).Decode(&body)
+	_ = json.NewDecoder(rr.Body).Decode(&body)
 	if body["enabled"] != true {
 		t.Errorf("expected enabled=true, got %v", body["enabled"])
 	}
