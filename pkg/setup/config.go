@@ -100,6 +100,26 @@ func (a *SetupAnswers) RuntimeName() string {
 	return "docker"
 }
 
+// ValidateTarget checks that a string is a valid deployment target.
+func ValidateTarget(s string) (DeploymentTarget, error) {
+	switch DeploymentTarget(s) {
+	case TargetWorkstation, TargetGCEVM, TargetNAS, TargetKubernetes:
+		return DeploymentTarget(s), nil
+	default:
+		return "", fmt.Errorf("invalid deployment target %q: must be one of workstation, gce-vm, nas, kubernetes", s)
+	}
+}
+
+// ValidateAuth checks that a string is a valid authentication method.
+func ValidateAuth(s string) (AuthMethod, error) {
+	switch AuthMethod(s) {
+	case AuthVertexAI, AuthAPIKey, AuthEnvironment, AuthNone:
+		return AuthMethod(s), nil
+	default:
+		return "", fmt.Errorf("invalid auth method %q: must be one of vertex-ai, api-key, environment, none", s)
+	}
+}
+
 // AuthSelectedType returns the auth_selectedType value for harness config.
 func (a *SetupAnswers) AuthSelectedType() string {
 	switch a.Auth {

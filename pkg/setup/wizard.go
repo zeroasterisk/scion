@@ -16,6 +16,7 @@
 package setup
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -23,8 +24,19 @@ import (
 	"github.com/GoogleCloudPlatform/scion/pkg/config"
 	"github.com/GoogleCloudPlatform/scion/pkg/harness"
 	"github.com/GoogleCloudPlatform/scion/pkg/util"
+	"github.com/charmbracelet/huh"
 	"gopkg.in/yaml.v3"
 )
+
+// handlePromptError checks if the error is a user abort (Ctrl+C/Esc) and
+// returns nil with a friendly message instead of propagating the raw error.
+func handlePromptError(err error) error {
+	if err != nil && errors.Is(err, huh.ErrUserAborted) {
+		fmt.Println("\nSetup cancelled.")
+		return nil
+	}
+	return err
+}
 
 // Options configures the setup wizard behavior via CLI flags.
 type Options struct {
@@ -67,7 +79,7 @@ func RunSetup(opts Options) error {
 			false,
 		)
 		if err != nil {
-			return err
+			return handlePromptError(err)
 		}
 		if !overwrite {
 			fmt.Println("\nSetup cancelled. Existing configuration preserved.")
@@ -83,11 +95,15 @@ func RunSetup(opts Options) error {
 
 	// Step 1: Deployment Target
 	if opts.Target != "" {
-		answers.Target = DeploymentTarget(opts.Target)
+		target, err := ValidateTarget(opts.Target)
+		if err != nil {
+			return err
+		}
+		answers.Target = target
 	} else {
 		target, err := promptDeploymentTarget()
 		if err != nil {
-			return err
+			return handlePromptError(err)
 		}
 		answers.Target = target
 	}
@@ -101,7 +117,7 @@ func RunSetup(opts Options) error {
 	if report.HasFailures() {
 		cont, err := promptConfirm("Some checks failed. Continue anyway?", false)
 		if err != nil {
-			return err
+			return handlePromptError(err)
 		}
 		if !cont {
 			fmt.Println("\nSetup cancelled. Fix the issues above and try again.")
@@ -111,11 +127,15 @@ func RunSetup(opts Options) error {
 
 	// Step 3: Authentication
 	if opts.Auth != "" {
-		answers.Auth = AuthMethod(opts.Auth)
+		auth, err := ValidateAuth(opts.Auth)
+		if err != nil {
+			return err
+		}
+		answers.Auth = auth
 	} else {
 		auth, err := promptAuthMethod()
 		if err != nil {
-			return err
+			return handlePromptError(err)
 		}
 		answers.Auth = auth
 	}
@@ -131,7 +151,7 @@ func RunSetup(opts Options) error {
 		if projectID == "" {
 			projectID, region, saKeyPath, err = promptVertexAIDetails()
 			if err != nil {
-				return err
+				return handlePromptError(err)
 			}
 		}
 
@@ -152,7 +172,7 @@ func RunSetup(opts Options) error {
 	case AuthAPIKey:
 		provider, err := promptAPIKeyProvider()
 		if err != nil {
-			return err
+			return handlePromptError(err)
 		}
 		answers.APIKeyProvider = provider
 
@@ -176,7 +196,7 @@ func RunSetup(opts Options) error {
 	case TargetGCEVM, TargetNAS, TargetKubernetes:
 		hostname, port, err := promptHostname()
 		if err != nil {
-			return err
+			return handlePromptError(err)
 		}
 		answers.HubHostname = hostname
 		answers.HubPort = port
@@ -188,7 +208,7 @@ func RunSetup(opts Options) error {
 	} else {
 		registry, err := promptImageRegistry()
 		if err != nil {
-			return err
+			return handlePromptError(err)
 		}
 		answers.ImageRegistry = registry
 	}
@@ -205,7 +225,7 @@ func RunSetup(opts Options) error {
 		true,
 	)
 	if err != nil {
-		return err
+		return handlePromptError(err)
 	}
 	if !writeConfig {
 		fmt.Println("\nSetup cancelled. No files were written.")
@@ -213,7 +233,7 @@ func RunSetup(opts Options) error {
 	}
 
 	// Write config and seed global directory
-	if err := writeSetupConfig(globalDir, settings); err != nil {
+	if err := writeSetupConfig(globalDir, settings, answers.ImageRegistry); err != nil {
 		return fmt.Errorf("failed to write configuration: %w", err)
 	}
 
@@ -223,7 +243,7 @@ func RunSetup(opts Options) error {
 	// Offer test agent
 	testAgent, err := promptConfirm("Would you like to start a test agent to verify everything works?", false)
 	if err != nil {
-		return err
+		return handlePromptError(err)
 	}
 	if testAgent {
 		fmt.Println()
@@ -261,7 +281,7 @@ func runManualMode() error {
 }
 
 // writeSetupConfig writes the settings and runs InitMachine to seed templates/harness-configs.
-func writeSetupConfig(globalDir string, settings *config.Settings) error {
+func writeSetupConfig(globalDir string, settings *config.Settings, imageRegistry string) error {
 	// Ensure directory exists
 	if err := os.MkdirAll(globalDir, 0755); err != nil {
 		return fmt.Errorf("failed to create directory %s: %w", globalDir, err)
@@ -273,15 +293,18 @@ func writeSetupConfig(globalDir string, settings *config.Settings) error {
 		return fmt.Errorf("failed to marshal settings: %w", err)
 	}
 
-	// Write settings file
+	// Write settings file with owner-only permissions (may contain paths to secrets)
 	settingsPath := filepath.Join(globalDir, "settings.yaml")
-	if err := os.WriteFile(settingsPath, data, 0644); err != nil {
+	if err := os.WriteFile(settingsPath, data, 0600); err != nil {
 		return fmt.Errorf("failed to write settings: %w", err)
 	}
 
 	// Run InitMachine to seed templates and harness-configs
 	harnesses := harness.All()
-	if err := config.InitMachine(harnesses, config.InitMachineOpts{Force: true}); err != nil {
+	if err := config.InitMachine(harnesses, config.InitMachineOpts{
+		Force:         true,
+		ImageRegistry: imageRegistry,
+	}); err != nil {
 		return fmt.Errorf("failed to initialize machine config: %w", err)
 	}
 

@@ -15,11 +15,13 @@
 package setup
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
 	"strings"
+	"time"
 
 	"github.com/GoogleCloudPlatform/scion/pkg/util"
 )
@@ -172,8 +174,10 @@ func checkDockerOrPodman() CheckResult {
 			continue
 		}
 
-		// Check daemon connectivity
-		_, daemonErr := exec.Command(name, "info").Output()
+		// Check daemon connectivity (with timeout to avoid hanging)
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		_, daemonErr := exec.CommandContext(ctx, name, "info").Output()
+		cancel()
 		if daemonErr != nil {
 			return CheckResult{
 				Name:        name,
@@ -315,12 +319,12 @@ func ValidateSAKeyFile(path string) []CheckResult {
 }
 
 // DetectRuntime returns the name of the detected container runtime.
-// Falls back to "docker" if nothing is detected.
+// Returns an empty string if no runtime is found.
 func DetectRuntime() string {
 	for _, name := range []string{"podman", "docker"} {
 		if _, err := exec.LookPath(name); err == nil {
 			return name
 		}
 	}
-	return "docker"
+	return ""
 }
